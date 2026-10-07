@@ -111,7 +111,7 @@ jobs:
           python3 scripts/package.py --binaries .tmp/universal --output .tmp/packages --version 0.1.0 --target macos-universal --native-installer
           tar -xzf .tmp/packages/craftlauncher-0.1.0-macos-universal.tar.gz -C .tmp/universal
           python3 scripts/native_smoke.py --binary .tmp/universal/CraftLauncher.app/Contents/MacOS/craftlauncher
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.platform != 'macos-x86_64'
         with:
           name: craftlauncher-${{ matrix.platform }}
@@ -137,7 +137,7 @@ jobs:
             dbus-run-session -- env DISPLAY=:99 python3.11 scripts/native_smoke.py --binary target/release/craftlauncher
             dbus-run-session -- env DISPLAY=:99 python3.11 scripts/qualify_updates.py
             python3.11 scripts/package.py --binaries target/release --output .tmp/packages --version 0.1.0 --target freebsd-x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: craftlauncher-freebsd-x86_64
           path: .tmp/packages/*

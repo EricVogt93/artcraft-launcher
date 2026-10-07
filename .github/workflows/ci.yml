@@ -106,7 +106,7 @@ jobs:
           python3 scripts/package.py --binaries .tmp/universal --output .tmp/packages --version ${{ steps.version.outputs.version }} --target macos-universal --native-installer
       - name: Upload distributions and checksums
         if: matrix.platform != 'macos-x86_64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: craftlauncher-${{ matrix.platform == 'macos-aarch64' && 'macos-universal' || matrix.platform }}
           path: .tmp/packages/*
@@ -130,7 +130,7 @@ jobs:
             cargo build --locked --release --bins
             version=$(cargo metadata --locked --no-deps --format-version 1 | python3.11 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "craftlauncher"))')
             python3.11 scripts/package.py --binaries target/release --output .tmp/packages --version "$version" --target freebsd-x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: craftlauncher-freebsd-x86_64
           path: .tmp/packages/*
