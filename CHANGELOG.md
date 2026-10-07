@@ -9,6 +9,7 @@ This changelog describes the launcher only. Changes to third-party apps are publ
 - Clear app selection, aligned download controls, automatic OS/CPU detection and a remembered save folder.
 - Original CraftLauncher logo for the sidebar, native window, tray and desktop entry.
 - Settings tabs for general preferences, launcher changes and project independence.
+- Closing the window quits on Wayland, where hiding to the tray is unavailable; supported window backends retain the optional tray behavior.
 
 ### Installs and updates
 - Verified package downloads, per-user installation, native launch, uninstall and previous-version rollback.

@@ -16,5 +16,6 @@ egui_extras.workspace = true
 image.workspace = true
 rfd.workspace = true
 open.workspace = true
+raw-window-handle = "0.6"
 tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 zbus = "5"

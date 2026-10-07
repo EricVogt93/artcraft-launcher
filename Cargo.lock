@@ -887,6 +887,7 @@ dependencies = [
  "egui_extras",
  "image",
  "open",
+ "raw-window-handle",
  "rfd",
  "tray-icon",
  "zbus",

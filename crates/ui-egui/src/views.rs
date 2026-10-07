@@ -1138,10 +1138,11 @@ impl Launcher {
             ui.label(RichText::new("Turn off automatic app updates to pause downloads and prepared automatic updates. Manual installs stay available. Per-app settings and version pins still apply.").size(11.0).color(self.palette.muted));
             ui.add_space(18.0); ui.separator(); ui.add_space(18.0);
             ui.label(RichText::new("DESKTOP").monospace().size(10.0).color(self.palette.muted));
-            changed |= widgets::checkbox(ui, self.palette, &mut settings.background, "Keep running in the tray when the window closes", true, false).changed();
+            changed |= widgets::checkbox(ui, self.palette, &mut settings.background, "Keep running in the tray when the window closes", self.can_hide_window && self.tray.is_some(), false).changed();
             changed |= widgets::checkbox(ui, self.palette, &mut settings.launch_at_login, "Start CraftLauncher when I sign in", true, false).changed();
             changed |= widgets::checkbox(ui, self.palette, &mut settings.notifications, "Notify me when an app update is ready", true, false).changed();
-            if self.tray.is_none() { ui.label(RichText::new("No system tray is available in this session. Closing the window will quit the launcher.").size(11.0).color(self.palette.muted)); }
+            if !self.can_hide_window { ui.label(RichText::new("Hiding to the tray is unavailable in this window session. Closing the window quits CraftLauncher.").size(11.0).color(self.palette.muted)); }
+            else if self.tray.is_none() { ui.label(RichText::new("No system tray is available in this session. Closing the window will quit the launcher.").size(11.0).color(self.palette.muted)); }
         });
         if changed {
             self.command(Command::Configure(settings));

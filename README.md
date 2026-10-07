@@ -29,7 +29,7 @@ The UI follows ArtCraft's warm paper colors, blue accent, Archivo lettering and 
 cargo run --locked --bin craftlauncher
 ```
 
-Rust 1.95 or newer is required. On Linux/FreeBSD, install X11 or Wayland libraries, a working OpenGL/Vulkan graphics driver, D-Bus and `xdg-desktop-portal` for file dialogs. The tray uses StatusNotifierItem on Linux/FreeBSD and native platform menus on Windows/macOS. If no tray watcher exists, closing the window quits normally.
+Rust 1.95 or newer is required. On Linux/FreeBSD, install X11 or Wayland libraries, a working OpenGL/Vulkan graphics driver, D-Bus and `xdg-desktop-portal` for file dialogs. The tray uses StatusNotifierItem on Linux/FreeBSD and native platform menus on Windows/macOS. Closing the window quits on Wayland or when no tray watcher exists; other window backends can keep running in the tray when enabled in Settings.
 
 For an optimized build:
 

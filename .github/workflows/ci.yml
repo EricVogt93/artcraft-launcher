@@ -126,6 +126,7 @@ jobs:
         with:
           path: target
           key: freebsd-14.3-${{ hashFiles('Cargo.lock') }}
+          restore-keys: freebsd-14.3-
       - uses: vmactions/freebsd-vm@v1
         with:
           release: '14.3'

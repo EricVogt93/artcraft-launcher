@@ -3,6 +3,7 @@ mod theme;
 mod tray;
 mod views;
 mod widgets;
+mod window;
 
 use assets::Assets;
 pub use assets::LOGO_PNG;
@@ -10,6 +11,7 @@ pub use assets::icon_rgba;
 pub const APP_ID: &str = "craftlauncher";
 use craftlauncher_core::{Command, Event, Manager, Progress, Snapshot, Worker, self_update};
 use egui::{Context, RichText};
+use raw_window_handle::HasWindowHandle;
 use std::{
     collections::BTreeSet,
     path::PathBuf,
@@ -52,6 +54,7 @@ pub struct Launcher {
     toast: Option<(String, bool, Instant)>,
     tray: Option<Tray>,
     tray_attempted: bool,
+    can_hide_window: bool,
     quit: bool,
     initially_hidden: bool,
     health: Option<HealthCheck>,
@@ -108,6 +111,7 @@ impl Launcher {
             toast: None,
             tray: None,
             tray_attempted: false,
+            can_hide_window: window::supports_hiding(cc.window_handle().ok().map(|h| h.as_raw())),
             quit: false,
             initially_hidden: background,
             health,
@@ -155,7 +159,7 @@ impl Launcher {
                 Ok(tray) => self.tray = Some(tray),
                 Err(_) => self.tray = None,
             }
-            if self.initially_hidden && self.tray.is_some() {
+            if self.initially_hidden && self.tray.is_some() && self.can_hide_window {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
@@ -179,14 +183,13 @@ impl Launcher {
             self.quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.quit
-            && self.tray.is_some()
-            && self.snapshot.state.settings.background
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
+        window::handle_close(
+            ctx,
+            !self.quit
+                && self.can_hide_window
+                && self.tray.is_some()
+                && self.snapshot.state.settings.background,
+        );
         if self
             .toast
             .as_ref()
