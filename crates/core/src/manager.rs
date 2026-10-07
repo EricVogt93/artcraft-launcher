@@ -1,7 +1,7 @@
 use crate::{
     AppPreferences, CATALOG, Channel, Installation, PendingUpdate, Progress, Release, ReleaseCache,
     Result, Settings, Snapshot, State, Version, fail,
-    installer::safe_relative,
+    installer::{safe_native_relative, safe_relative},
     model::{STATE_SCHEMA, is_newer, now},
     persistence::atomic_json,
     platform::{Native, Platform, package_kind},
@@ -141,7 +141,7 @@ impl Manager {
     }
     pub fn managed_path(&self, id: &str, relative: &Path) -> Result<PathBuf> {
         crate::app(id)?;
-        if !safe_relative(relative) {
+        if !safe_native_relative(relative) {
             return Err(fail("Invalid managed installation path."));
         }
         let base = self.root.join("apps").join(id);

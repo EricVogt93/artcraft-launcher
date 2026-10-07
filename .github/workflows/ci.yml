@@ -83,7 +83,7 @@ jobs:
           choco install nsis -y
           'C:\Program Files (x86)\NSIS' | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Unit and lifecycle tests
-        run: cargo test --locked --workspace --target ${{ matrix.rust }}
+        run: cargo test --locked --release --workspace --target ${{ matrix.rust }}
       - name: Build launcher, bootstrap and updater
         run: cargo build --locked --release --bins --target ${{ matrix.rust }}
       - name: Read workspace version
@@ -122,6 +122,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: freebsd-14.3-${{ hashFiles('Cargo.lock') }}
       - uses: vmactions/freebsd-vm@v1
         with:
           release: '14.3'
@@ -129,7 +133,7 @@ jobs:
           prepare: pkg install -y rust pkgconf python311 libX11 libXcursor libXi libXrandr libxkbcommon wayland mesa-dri libglvnd dbus
           run: |
             set -eu
-            cargo test --locked --workspace
+            cargo test --locked --release --workspace
             cargo build --locked --release --bins
             version=$(cargo metadata --locked --no-deps --format-version 1 | python3.11 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "craftlauncher"))')
             python3.11 scripts/package.py --binaries target/release --output .tmp/packages --version "$version" --target freebsd-x86_64

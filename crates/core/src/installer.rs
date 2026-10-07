@@ -18,6 +18,17 @@ pub fn safe_relative(path: &Path) -> bool {
         && !path.to_string_lossy().contains('\\')
         && !path.to_string_lossy().contains(':')
 }
+/// Managed paths use the host's separators; archive and manifest paths remain strict.
+pub fn safe_native_relative(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        safe_relative(Path::new(&path.to_string_lossy().replace('\\', "/")))
+    }
+    #[cfg(not(windows))]
+    {
+        safe_relative(path)
+    }
+}
 fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         Err(fail("Download cancelled."))
@@ -90,10 +101,13 @@ pub fn extract_zip(
     for index in 0..archive.len() {
         check_cancel(cancel)?;
         let mut entry = archive.by_index(index).map_err(|e| fail(e.to_string()))?;
+        if !safe_relative(Path::new(entry.name())) {
+            return Err(fail("The ZIP contains an unsafe path."));
+        }
         let name = entry
             .enclosed_name()
             .ok_or_else(|| fail("The ZIP contains an unsafe path."))?;
-        if !safe_relative(&name) {
+        if !safe_native_relative(&name) {
             return Err(fail("The ZIP contains an unsafe path."));
         }
         total = total.saturating_add(entry.size());
@@ -258,4 +272,79 @@ pub fn make_executable(path: &Path) -> io::Result<()> {
         let _ = path;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_paths_accept_native_separators_but_reject_escape_and_stream_paths() {
+        let path = PathBuf::from("versions")
+            .join("one")
+            .join("payload")
+            .join("tool.exe");
+        assert!(safe_native_relative(&path));
+        for path in [
+            "",
+            "../outside",
+            "/absolute",
+            r"C:\outside",
+            r"C:outside",
+            r"\\server\share",
+            r"versions\..\outside",
+            "tool.exe:stream",
+        ] {
+            assert!(!safe_native_relative(Path::new(path)), "accepted {path}");
+        }
+        let mut deep = PathBuf::new();
+        for _ in 0..33 {
+            deep.push("directory");
+        }
+        assert!(!safe_native_relative(&deep));
+    }
+
+    #[test]
+    fn archive_paths_keep_portable_separator_rules_on_every_host() {
+        assert!(safe_relative(Path::new("payload/folder/tool.exe")));
+        for path in [
+            r"payload\folder\tool.exe",
+            r"payload\..\outside",
+            "payload/../outside",
+            "tool.exe:stream",
+            r"\\server\share",
+            "/absolute",
+        ] {
+            assert!(!safe_relative(Path::new(path)), "accepted {path}");
+        }
+    }
+
+    #[test]
+    fn zip_nested_files_extract_with_host_paths_and_backslash_names_are_rejected() {
+        use zip::{ZipWriter, write::SimpleFileOptions};
+        let fixture = tempfile::tempdir().unwrap();
+        let archive = fixture.path().join("package.zip");
+        let mut zip = ZipWriter::new(File::create(&archive).unwrap());
+        zip.start_file("payload/folder/tool.exe", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"native payload").unwrap();
+        zip.finish().unwrap();
+        let destination = fixture.path().join("valid");
+        fs::create_dir(&destination).unwrap();
+        extract_zip(&archive, &destination, &AtomicBool::new(false), false).unwrap();
+        assert_eq!(
+            fs::read(destination.join("payload/folder/tool.exe")).unwrap(),
+            b"native payload"
+        );
+
+        let mut zip = ZipWriter::new(File::create(&archive).unwrap());
+        zip.start_file(r"payload\folder\tool.exe", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"unsafe name").unwrap();
+        zip.finish().unwrap();
+        let destination = fixture.path().join("invalid");
+        fs::create_dir(&destination).unwrap();
+        assert!(extract_zip(&archive, &destination, &AtomicBool::new(false), false).is_err());
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+    }
 }

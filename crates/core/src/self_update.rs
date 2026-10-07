@@ -2,7 +2,7 @@
 //! after the launcher releases its library lock, and waits for a first-frame health ack.
 use crate::{
     Result, fail,
-    installer::{extract_tar, extract_zip, make_executable, safe_relative},
+    installer::{extract_tar, extract_zip, make_executable, safe_native_relative, safe_relative},
     model::{Channel, is_newer},
     persistence::atomic_json,
 };
@@ -220,7 +220,7 @@ pub fn prepare(
     }))
 }
 fn within(root: &Path, relative: &Path) -> Result<PathBuf> {
-    if !safe_relative(relative) || !relative.starts_with("launcher/versions") {
+    if !safe_native_relative(relative) || !relative.starts_with("launcher/versions") {
         return Err(fail("Invalid launcher update path."));
     }
     let path = fs::canonicalize(root.join(relative))?;
