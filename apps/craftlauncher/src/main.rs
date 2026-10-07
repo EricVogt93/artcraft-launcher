@@ -4,7 +4,6 @@ use clap::Parser;
 use craftlauncher_core::{
     Manager, Result, fail,
     model::{Channel, Theme},
-    platform::{Native, Platform},
     self_update,
 };
 use std::{
@@ -20,7 +19,7 @@ struct Args {
     /// Library location; defaults to the native per-user data directory.
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Start hidden if a system tray is available.
+    /// Start in the tray when the session supports hidden windows.
     #[arg(long)]
     background: bool,
     #[arg(long)]
@@ -463,11 +462,11 @@ fn register_launcher(executable: &Path) -> Result<()> {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let _ = executable;
-        return Err(fail(
+        Err(fail(
             "Use the native installer or application bundle to register CraftLauncher.",
-        ));
+        ))
     }
-    let _ = Native.os();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     Ok(())
 }
 

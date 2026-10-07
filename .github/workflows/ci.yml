@@ -104,7 +104,7 @@ jobs:
           mkdir -p .tmp/universal
           for binary in craftlauncher craftlauncher-bootstrap craftlauncher-updater; do
             lipo -create target/aarch64-apple-darwin/release/$binary target/x86_64-apple-darwin/release/$binary -output .tmp/universal/$binary
-            lipo -verify_arch x86_64 arm64 .tmp/universal/$binary
+            lipo .tmp/universal/$binary -verify_arch x86_64 arm64
           done
           python3 scripts/package.py --binaries .tmp/universal --output .tmp/packages --version ${{ steps.version.outputs.version }} --target macos-universal --native-installer
       - name: Upload distributions and checksums
