@@ -1,0 +1,13 @@
+# Build against the planned glibc 2.35 baseline (Ubuntu 22.04).
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive RUSTUP_HOME=/usr/local/rustup
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | CARGO_HOME=/usr/local/cargo sh -s -- -y --profile minimal --default-toolchain 1.99.0 \
+    && chmod -R a+rX /usr/local/rustup /usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libx11-dev libx11-xcb1 libxcursor1 libxi6 libxrandr2 libxkbcommon-x11-0 libxkbcommon-dev libwayland-dev dpkg-dev rpm cpio file python3 dbus-x11 xvfb xauth libgl1-mesa-dri mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+ENV CARGO_TARGET_DIR=/build CARGO_HOME=/cargo
+WORKDIR /work
+CMD ["cargo", "build", "--locked", "--release", "--bins"]

@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Rust quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  native:
+    name: Build ${{ matrix.platform }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            rust: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+          - runner: ubuntu-22.04-arm
+            rust: aarch64-unknown-linux-gnu
+            platform: linux-aarch64
+          - runner: windows-2022
+            rust: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+          - runner: windows-2022
+            rust: i686-pc-windows-msvc
+            platform: windows-x86
+          - runner: windows-11-arm
+            rust: aarch64-pc-windows-msvc
+            platform: windows-aarch64
+          - runner: macos-15-intel
+            rust: x86_64-apple-darwin
+            platform: macos-x86_64
+          - runner: macos-15
+            rust: aarch64-apple-darwin
+            platform: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev dpkg-dev rpm file
+      - name: Install Windows packaging tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis -y
+          'C:\Program Files (x86)\NSIS' | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Unit and lifecycle tests
+        run: cargo test --locked --workspace --target ${{ matrix.rust }}
+      - name: Build launcher, bootstrap and updater
+        run: cargo build --locked --release --bins --target ${{ matrix.rust }}
+      - name: Read workspace version
+        id: version
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | python -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "craftlauncher"))')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Package Linux and Windows
+        if: runner.os != 'macOS'
+        run: python scripts/package.py --binaries target/${{ matrix.rust }}/release --output .tmp/packages --version ${{ steps.version.outputs.version }} --target ${{ matrix.platform }} --native-installer
+      - name: Package universal macOS application and DMG
+        if: matrix.platform == 'macos-aarch64'
+        shell: bash
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --locked --release --bins --target x86_64-apple-darwin
+          mkdir -p .tmp/universal
+          for binary in craftlauncher craftlauncher-bootstrap craftlauncher-updater; do
+            lipo -create target/aarch64-apple-darwin/release/$binary target/x86_64-apple-darwin/release/$binary -output .tmp/universal/$binary
+            lipo -verify_arch x86_64 arm64 .tmp/universal/$binary
+          done
+          python3 scripts/package.py --binaries .tmp/universal --output .tmp/packages --version ${{ steps.version.outputs.version }} --target macos-universal --native-installer
+      - name: Upload distributions and checksums
+        if: matrix.platform != 'macos-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: craftlauncher-${{ matrix.platform == 'macos-aarch64' && 'macos-universal' || matrix.platform }}
+          path: .tmp/packages/*
+          if-no-files-found: error
+          retention-days: 30
+
+  freebsd:
+    name: Build freebsd-x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.3'
+          usesh: true
+          prepare: pkg install -y rust pkgconf python311 libX11 libXcursor libXi libXrandr libxkbcommon wayland mesa-dri libglvnd dbus
+          run: |
+            set -eu
+            cargo test --locked --workspace
+            cargo build --locked --release --bins
+            version=$(cargo metadata --locked --no-deps --format-version 1 | python3.11 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "craftlauncher"))')
+            python3.11 scripts/package.py --binaries target/release --output .tmp/packages --version "$version" --target freebsd-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: craftlauncher-freebsd-x86_64
+          path: .tmp/packages/*
+          if-no-files-found: error
+          retention-days: 30
+
+  gate:
+    name: All platforms
+    if: always()
+    needs: [quality, native, freebsd]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require every test, build and package job to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          failed = {name: job['result'] for name, job in results.items() if job['result'] != 'success'}
+          if failed:
+              raise SystemExit(f"CI did not pass on all platforms: {failed}")
+          print('All required tests, native builds and packages passed.')
+          PY

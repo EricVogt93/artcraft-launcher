@@ -1,0 +1,23 @@
+[package]
+name = "craftlauncher"
+description = "A native Rust toolbox for ArtCraft creative apps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+default-run = "craftlauncher"
+
+[lints]
+workspace = true
+
+[dependencies]
+craftlauncher-core.workspace = true
+craftlauncher-ui-egui.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
+hex = "0.4"
+getrandom = "0.3"

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/ui-egui", "apps/craftlauncher"]
+default-members = ["apps/craftlauncher"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+craftlauncher-core = { path = "crates/core" }
+craftlauncher-ui-egui = { path = "crates/ui-egui" }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
+egui = "0.36"
+egui_extras = { version = "0.36", default-features = false, features = ["svg", "image"] }
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rfd = "0.17"
+open = "5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "deny"
+
+[profile.dev]
+opt-level = 1
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

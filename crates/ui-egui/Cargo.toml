@@ -1,0 +1,20 @@
+[package]
+name = "craftlauncher-ui-egui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+craftlauncher-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+image.workspace = true
+rfd.workspace = true
+open.workspace = true
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+zbus = "5"

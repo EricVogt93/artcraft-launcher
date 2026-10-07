@@ -1,0 +1,11 @@
+* text=auto
+*.rs text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+assets/** linguist-vendored
+Cargo.lock linguist-generated
+# Preserve the bundled upstream license text verbatim.
+assets/*-OFL.txt whitespace=-blank-at-eol
