@@ -8,6 +8,8 @@ Validated on 2026-10-07 in this workspace. Version: **0.1.0**. This is local imp
 
 The 41 tests comprise one Linux/FreeBSD desktop-identity unit test, eight core unit tests, 19 app lifecycle/package tests, three Unix/Linux integration tests, eight launcher update tests, one theme test and one bundled-logo test. They cover checksums and cancellation, atomic persistence failures, library locking, external installation preservation, release pins, deferred activation, global automatic-update pause/reload/resume and manual installation while paused, rollback, archive traversal and bundle symlinks, exact platform/architecture selection, batch downloads and existing-file protection, signed manifests, payload tampering, helper failures, health timeouts and theme overrides. The integration tests execute actual bin wrappers with quoted paths and forwarded arguments, protect unmanaged entries and newer registrations, and check AppDir extraction, internal/escaping links and cancellation. Deferred-running-app lifecycle tests use a controlled platform service; separate tests execute real native payloads.
 
+The initial GitHub matrix exposed an empty-file synchronization race in the native launch test and macOS’s `/var` → `/private/var` alias in a self-update assertion. The corrected tests wait for actual child output, retain the original deadline and compare canonical file identity. The empty-file race was reproduced with a controlled child before fixing the assertion; updater tests now exercise a symlinked library on every Unix runner.
+
 ## Observed native behavior
 
 | Check | Observed result |

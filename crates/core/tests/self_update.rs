@@ -179,11 +179,19 @@ fn run_job(payload: &[u8], expected_success: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let library = tmp.path().join("library");
     fs::create_dir(&library).unwrap();
+    // Exercise aliases such as macOS /var -> /private/var on every Unix runner.
+    let alias = tmp.path().join("library-alias");
+    std::os::unix::fs::symlink(&library, &alias).unwrap();
+    let library = alias;
     let previous = tmp.path().join("previous");
     let marker = tmp.path().join("restored");
     fs::write(
         &previous,
-        format!("#!/bin/sh\nprintf restored > '{}'\n", marker.display()),
+        format!(
+            "#!/bin/sh\n: > '{}'\nsleep 0.05\nprintf restored > '{}'\n",
+            marker.display(),
+            marker.display()
+        ),
     )
     .unwrap();
     craftlauncher_core::installer::make_executable(&previous).unwrap();
@@ -211,16 +219,18 @@ fn run_job(payload: &[u8], expected_success: bool) {
     assert_eq!(self_update::apply_job(&library).unwrap(), expected_success);
     let current = self_update::current_executable(&library).unwrap().unwrap();
     assert_eq!(
-        current,
+        current.canonicalize().unwrap(),
         if expected_success {
             library.join(&prepared.executable)
         } else {
             previous
         }
+        .canonicalize()
+        .unwrap()
     );
     if !expected_success {
         for _ in 0..50 {
-            if marker.exists() {
+            if fs::read_to_string(&marker).is_ok_and(|value| value == "restored") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

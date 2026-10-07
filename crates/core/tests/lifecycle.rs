@@ -521,13 +521,17 @@ fn internal_bundle_links_work_but_escaped_links_fail() {
 fn native_launch_executes_the_selected_payload() {
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("launched");
-    let script = format!("#!/bin/sh\nprintf '%s' launched > '{}'\n", marker.display());
+    let script = format!(
+        "#!/bin/sh\n: > '{}'\nsleep 0.05\nprintf '%s' launched > '{}'\n",
+        marker.display(),
+        marker.display()
+    );
     let (mut manager, fixture, _) = setup(&tmp.path().join("library"));
     fixture.lock().unwrap().bytes = archive(script.as_bytes());
     install(&mut manager);
     assert!(manager.launch("photocraft").unwrap().is_some());
     for _ in 0..50 {
-        if marker.exists() {
+        if fs::read_to_string(&marker).is_ok_and(|value| value == "launched") {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

@@ -26,6 +26,8 @@ jobs:
         with:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev
       - run: cargo fmt --all --check
@@ -70,6 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.rust }}
+          cache-on-failure: true
       - name: Install Linux packaging tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev dpkg-dev rpm file
