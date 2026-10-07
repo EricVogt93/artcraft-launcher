@@ -12,6 +12,8 @@ The initial GitHub matrix exposed an empty-file synchronization race in the nati
 
 Windows CI also exposed rejection of the host’s native path separators in managed app/update paths. Native managed paths now use host-aware validation; raw archive and manifest paths keep strict portable separator rules. Three additional tests cover native paths, traversal/drive/stream rejection and real nested ZIP extraction.
 
+Six additional Python release-staging tests check complete platform artifacts, unchanged asset copying, hash tampering, checksum traversal, mismatched manifest versions and unexpected files. The validator also passed against all 30 real assets from the successful [eight-target CI run](https://github.com/EricVogt93/artcraft-launcher/actions/runs/37608949825). Native build/test/package success is separate from graphics and installer runtime qualification.
+
 ## Observed native behavior
 
 | Check | Observed result |
@@ -68,4 +70,4 @@ The last command temporarily builds a different embedded version, exercises heal
 
 Windows x86/x64/ARM64, macOS Intel/Apple Silicon, Linux ARM64 and FreeBSD have native build/test/packaging jobs in `.github/workflows/qualify.yml`; none of those remote jobs has run from this workspace. Windows 10, macOS 11 and FreeBSD baseline claims require actual machines/VMs. macOS universal bundle, DMG, ad-hoc signing and Windows NSIS behavior remain unqualified locally. Packaging CraftLauncher itself as an optional AppImage has not been qualified here; installation and native integration of an upstream app's real AppImage have been checked as described above.
 
-No production update feed, public release, Developer ID/notarization or Authenticode operation was performed. Launcher self-updates currently use a local signed feed. App availability depends on upstream's actual published assets; ArtCraft has no compatible Linux native asset in the checked release and opens its hosted studio from this launcher.
+No production update feed, Developer ID/notarization or Authenticode operation was performed. Main CI publishes public distribution packages through GitHub Releases. Launcher self-updates currently use a local signed feed. App availability depends on upstream's actual published assets; ArtCraft has no compatible Linux native asset in the checked release and opens its hosted studio from this launcher.

@@ -6,11 +6,13 @@
 
 Your creative tools, ready to launch.
 
-[Build status](https://github.com/EricVogt93/artcraft-launcher/actions/workflows/ci.yml) · [Build artifacts](https://github.com/EricVogt93/artcraft-launcher/actions/workflows/ci.yml) · [Build from source](#run) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
+[Download](https://github.com/EricVogt93/artcraft-launcher/releases/latest) · [Build status](https://github.com/EricVogt93/artcraft-launcher/actions/workflows/ci.yml) · [Build from source](#run) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
 ![CI](https://github.com/EricVogt93/artcraft-launcher/actions/workflows/ci.yml/badge.svg?branch=main)
 
 A native Rust toolbox for the [ArtCraft family](https://github.com/storytold). Install, launch, update and manage ArtCraft, PhotoCraft, VectorCraft, FilmCraft, LightCraft, PrintCraft, EffectCraft and DesignCraft in one desktop app.
+
+**Independent project by Eric Vogt.** I develop only CraftLauncher. I am not affiliated with, employed by, sponsored by or endorsed by ArtCraft, Storytold or any of the applications this launcher manages. Their developers are solely responsible for their applications, licenses, updates and support. Please report launcher issues here and application issues to the respective upstream project.
 
 The UI follows ArtCraft's warm paper colors, blue accent, Archivo lettering and Instrument Serif headings. It uses **Rust 2024, eframe/egui 0.36, wgpu and rfd**, with no Electron, embedded browser or web UI.
 
@@ -84,7 +86,7 @@ In **Settings → Updates**, **Automatically update installed apps** controls au
 
 ## CI and repository workflow
 
-Pull requests into `main` run format/lint checks, unit and lifecycle tests, and native builds for Linux x86_64/ARM64, Windows x86/x64/ARM64, macOS Intel/Apple Silicon and FreeBSD x86_64. After merge, `main` builds everything again and uploads installers, portable archives, SHA-256 sums and unsigned update manifests as 30-day Actions artifacts. macOS ships a universal application and DMG. The separate manual qualification workflow exercises native graphics and update recovery.
+Pull requests into `main` run format/lint checks, unit and lifecycle tests, and native builds for Linux x86_64/ARM64, Windows x86/x64/ARM64, macOS Intel/Apple Silicon and FreeBSD x86_64. After merge, `main` builds everything again and uploads installers, portable archives, SHA-256 sums and unsigned update manifests as 30-day Actions artifacts. Once **All platforms** passes, CI verifies all platform assets and publishes them as a [GitHub Release](https://github.com/EricVogt93/artcraft-launcher/releases/latest). Each main build has a unique tag, `v<version>+build.<run>.<attempt>`, bound to its exact commit; package and embedded versions use the workspace version. macOS ships a universal application and DMG. The separate manual qualification workflow exercises native graphics and update recovery.
 
 `development` → `staging` → `main` is the promotion path. `main` requires an approving PR review and a passing **All platforms** check; it blocks direct pushes, force pushes and deletion. `staging` and `development` have deletion and force-push protection. See [contribution guidelines](CONTRIBUTING.md) and [release operations](docs/RELEASES.md).
 
@@ -102,7 +104,7 @@ python3 scripts/package.py --binaries target/release --output /tmp/craftlauncher
 
 The payload **must actually be built with that version**. For development feeds, build with `CRAFTLAUNCHER_BUILD_VERSION=0.2.0 cargo build --release --bins`. A label on an old executable will fail the health check and roll back.
 
-Select the feed folder and the hexadecimal public key in Settings. The launcher verifies Ed25519 signatures and the entire archive, binds extracted executables to its signed contents and prepares updates without modifying the current program. Use Restart to update, or reopen the launcher to activate a prepared update. No public update endpoint, remote publishing, signing credentials or production release has been configured.
+Select the feed folder and the hexadecimal public key in Settings. The launcher verifies Ed25519 signatures and the entire archive, binds extracted executables to its signed contents and prepares updates without modifying the current program. Use Restart to update, or reopen the launcher to activate a prepared update. GitHub Releases provide public package downloads; the launcher update feed remains local and requires your own signing key.
 
 ## Validate
 

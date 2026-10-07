@@ -1,6 +1,6 @@
 # Build, qualify, package
 
-The main CI workflow `ci.yml` runs on PRs into `main`, merge-queue candidates and every push to `main`. It checks format/lints, runs unit and lifecycle tests in the release profile, builds all eight native OS/architecture targets, and uploads installers and archives as Actions artifacts. Its **All platforms** job requires every dependency to succeed and is the protected branch’s mandatory check. Native graphics and installer qualification run separately, using manual dispatch.
+The main CI workflow `ci.yml` runs on PRs into `main`, merge-queue candidates and every push to `main`. It checks format/lints, runs unit and lifecycle tests in the release profile, builds all eight native OS/architecture targets, and uploads installers and archives as Actions artifacts. Its **All platforms** job requires every dependency to succeed and is the protected branch’s mandatory check. A successful push to `main` then publishes a GitHub Release containing every platform's distributions, checksums and manifests. Native graphics and installer qualification run separately, using manual dispatch.
 
 The workflow `qualify.yml` builds and runs core tests on native Linux x86_64/ARM64, Windows x86/x64/ARM64 and macOS Intel/Apple Silicon runners; FreeBSD 14.3 uses a VM. Its UI smoke requires a successful native first-frame acknowledgement and persisted reload, rather than treating compilation as runtime proof. Windows also installs, runs and removes the per-user NSIS package. macOS constructs universal binaries, verifies both Mach-O architectures and smoke-tests the signed app bundle. Read the Actions results for current build status; the manual graphics qualification workflow is a separate requirement.
 
@@ -22,7 +22,9 @@ Existing shortcuts route through the original executable/bootstrap to the curren
 
 ## Signing and publishing
 
-macOS bundles currently receive ad-hoc signatures for local verification. Developer ID signing/notarization, Windows Authenticode, public release feeds and release publication require the owning project's credentials and a separate release operation. The CI has read-only repository permissions and uploads unsigned local manifests as build artifacts; it does not publish releases or embed a signing key.
+Only the main-release job receives `contents: write`; build and PR jobs keep read-only repository permissions. The publisher downloads this workflow run's seven artifact bundles, requires all platform packages, checks every SHA-256 sum and binds each manifest to its exact archive, version and native target before publication. Six Python tests exercise complete assets and failure cases. Its tag `v<version>+build.<run>.<attempt>` points at the exact built commit, so later main commits and retries receive distinct tags. The package and embedded version remains the workspace version; bump it for a new launcher version. Download packages from [GitHub Releases](https://github.com/EricVogt93/artcraft-launcher/releases/latest).
+
+macOS bundles receive ad-hoc signatures. Developer ID signing/notarization, Windows Authenticode and a trusted public launcher update feed still require the owning project's signing credentials. Published local-feed manifests are unsigned and are not trusted automatically by the launcher. CI does not embed a signing key.
 
 See `scripts/update_smoke.py` for healthy and mismatched-version counterprobes against actual separate launcher/helper processes. Core tests additionally cover signature changes, wrong keys, archive substitution, extracted helper tampering, no-health failure, spawn failure and timeout recovery.
 

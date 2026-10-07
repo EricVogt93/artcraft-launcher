@@ -18,6 +18,6 @@ This changelog describes the launcher only. Changes to third-party apps are publ
 - Signed local launcher updates with a separate helper, first-frame health checks and automatic recovery.
 
 ### Project
-- Native build and test CI for Linux, Windows, macOS and FreeBSD; packages are available as Actions artifacts.
+- Native build and test CI for Linux, Windows, macOS and FreeBSD; successful main builds publish all platform packages and checksums as GitHub Releases.
 - Apache-2.0 source license, preserved third-party attributions, contribution and security guidance.
 - CraftLauncher is developed independently by Eric Vogt and is not affiliated with the applications it manages.

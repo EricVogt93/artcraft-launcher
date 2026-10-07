@@ -32,6 +32,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Release asset validation tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
   native:
     name: Build ${{ matrix.platform }}
@@ -163,3 +165,43 @@ jobs:
               raise SystemExit(f"CI did not pass on all platforms: {failed}")
           print('All required tests, native builds and packages passed.')
           PY
+
+  release:
+    name: Publish main release
+    needs: gate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: craftlauncher-*
+          path: .tmp/release-artifacts
+          merge-multiple: false
+      - name: Verify and publish every native distribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          python3 scripts/prepare_release.py --artifacts .tmp/release-artifacts --output .tmp/release-assets --version "$version"
+          tag="v${version}+build.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          export RELEASE_VERSION="$version"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          Path('.tmp/release-notes.md').write_text(
+              f"CraftLauncher {os.environ['RELEASE_VERSION']} — native main build.\n\n"
+              f"Source commit: `{os.environ['GITHUB_SHA']}`.\n\n"
+              f"[Passing build and tests](https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}).\n\n"
+              "Downloads include Linux x86_64/ARM64 tar.gz, DEB and RPM; Windows x86/x64/ARM64 ZIP and per-user installers; a universal macOS app/DMG; and a FreeBSD x86_64 archive. SHA-256 sums are included.\n\n"
+              "Eric Vogt develops only CraftLauncher. He is not affiliated with ArtCraft, Storytold or the applications it manages; those applications have their own developers and support.\n\n"
+              "Windows packages are not Authenticode-signed; macOS uses ad-hoc signing and is not notarized. The included update manifests are unsigned and require signing for a trusted local update feed. Native build/test success does not qualify every desktop graphics environment.\n"
+          )
+          PY
+          gh release create "$tag" .tmp/release-assets/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "CraftLauncher $version (main build $GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT)" --notes-file .tmp/release-notes.md --latest
