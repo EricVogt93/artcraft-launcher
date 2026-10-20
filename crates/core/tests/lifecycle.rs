@@ -883,6 +883,7 @@ fn project_arguments_are_literal_and_recent_history_survives_reload() {
     manager.link("photocraft", executable).unwrap();
     let project = tmp.path().join("project ; $(touch nope).PSD");
     fs::write(&project, b"fixture").unwrap();
+    let project = fs::canonicalize(project).unwrap();
     manager.open_project("photocraft", project.clone()).unwrap();
     for _ in 0..100 {
         if record.exists() {
