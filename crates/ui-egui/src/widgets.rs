@@ -61,7 +61,7 @@ pub fn nav_button(
             painter.line_segment([point(3.0, 2.0), point(8.0, 2.0)], stroke);
             painter.line_segment([point(3.0, 2.0), point(3.0, 5.0)], stroke);
         }
-        Page::Updates => {
+        Page::Queue | Page::Updates => {
             painter.line_segment([point(9.0, 1.0), point(9.0, 12.0)], stroke);
             painter.add(egui::Shape::line(
                 vec![point(4.0, 8.0), point(9.0, 13.0), point(14.0, 8.0)],
@@ -69,7 +69,7 @@ pub fn nav_button(
             ));
             painter.line_segment([point(2.0, 17.0), point(16.0, 17.0)], stroke);
         }
-        Page::Activity => {
+        Page::Discover | Page::Activity => {
             painter.circle_stroke(point(9.0, 9.0), 8.0, stroke);
             painter.add(egui::Shape::line(
                 vec![point(9.0, 4.0), point(9.0, 9.0), point(13.0, 11.0)],

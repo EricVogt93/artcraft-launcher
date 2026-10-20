@@ -3,8 +3,8 @@ use crate::{
     widgets::{self, ButtonKind, CONTROL_HEIGHT},
 };
 use craftlauncher_core::{
-    App, AppPreferences, CATALOG, Channel, Command, Theme, model::is_newer, releases::asset_for,
-    self_update,
+    App, AppPreferences, CATALOG, Channel, Command, Theme, catalog::DISCIPLINES, model::is_newer,
+    releases::asset_for, self_update,
 };
 use egui::{Align, Color32, Context, Frame, Layout, RichText, Stroke, Ui, Vec2};
 use std::time::Instant;
@@ -20,80 +20,113 @@ impl Launcher {
                     .inner_margin(egui::Margin::symmetric(18, 24)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    self.brand(ui, 30.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new("CRAFT").size(16.0).strong());
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar-scroll")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            self.brand(ui, 30.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(RichText::new("CRAFT").size(16.0).strong());
+                                ui.label(
+                                    RichText::new("LAUNCHER")
+                                        .size(10.0)
+                                        .color(self.palette.muted),
+                                );
+                            });
+                        });
+                        ui.add_space(44.0);
                         ui.label(
-                            RichText::new("LAUNCHER")
-                                .size(10.0)
-                                .color(self.palette.muted),
+                            RichText::new("YOUR WORKSPACE")
+                                .monospace()
+                                .size(9.0)
+                                .color(self.palette.faint),
                         );
+                        ui.add_space(10.0);
+                        let installed = self.snapshot.state.installations.len();
+                        let updates = self.update_count();
+                        for (page, name, count) in [
+                            (Page::MyApps, "My apps", Some(installed)),
+                            (Page::AllApps, "All apps", None),
+                            (Page::Updates, "Updates", Some(updates)),
+                            (
+                                Page::Queue,
+                                "Queue",
+                                Some(
+                                    self.workflows
+                                        .tasks
+                                        .iter()
+                                        .filter(|task| {
+                                            matches!(
+                                                task.status,
+                                                crate::workflows::TaskStatus::Waiting
+                                                    | crate::workflows::TaskStatus::Running
+                                            )
+                                        })
+                                        .count(),
+                                ),
+                            ),
+                            (
+                                Page::Discover,
+                                "Discover",
+                                Some(self.snapshot.state.discovered_apps.len()),
+                            ),
+                            (Page::Activity, "Activity", None),
+                        ] {
+                            if widgets::nav_button(
+                                ui,
+                                self.palette,
+                                page,
+                                name,
+                                self.page == page,
+                                count,
+                            )
+                            .clicked()
+                            {
+                                self.page = page;
+                                self.search.clear();
+                            }
+                        }
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.add_space(2.0);
+                            if widgets::nav_button(
+                                ui,
+                                self.palette,
+                                Page::Settings,
+                                "Settings",
+                                self.page == Page::Settings,
+                                None,
+                            )
+                            .clicked()
+                            {
+                                self.page = Page::Settings;
+                            }
+                            ui.add_space(20.0);
+                            ui.separator();
+                            ui.add_space(18.0);
+                            ui.label(
+                                RichText::new("Made for making.")
+                                    .font(theme::italic(23.0))
+                                    .color(self.palette.muted),
+                            );
+                            ui.label(
+                                RichText::new("Open tools. Endless possibilities.")
+                                    .size(10.0)
+                                    .color(self.palette.faint),
+                            );
+                            ui.add_space(18.0);
+                            if ui
+                                .link(
+                                    RichText::new("Meet the Craft family ↗")
+                                        .size(11.0)
+                                        .color(self.palette.muted),
+                                )
+                                .clicked()
+                            {
+                                self.external("https://getartcraft.com/apps".into());
+                            }
+                        });
                     });
-                });
-                ui.add_space(44.0);
-                ui.label(
-                    RichText::new("YOUR WORKSPACE")
-                        .monospace()
-                        .size(9.0)
-                        .color(self.palette.faint),
-                );
-                ui.add_space(10.0);
-                let installed = self.snapshot.state.installations.len();
-                let updates = self.update_count();
-                for (page, name, count) in [
-                    (Page::MyApps, "My apps", Some(installed)),
-                    (Page::AllApps, "All apps", None),
-                    (Page::Updates, "Updates", Some(updates)),
-                    (Page::Activity, "Activity", None),
-                ] {
-                    if widgets::nav_button(ui, self.palette, page, name, self.page == page, count)
-                        .clicked()
-                    {
-                        self.page = page;
-                        self.search.clear();
-                    }
-                }
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    ui.add_space(2.0);
-                    if widgets::nav_button(
-                        ui,
-                        self.palette,
-                        Page::Settings,
-                        "Settings",
-                        self.page == Page::Settings,
-                        None,
-                    )
-                    .clicked()
-                    {
-                        self.page = Page::Settings;
-                    }
-                    ui.add_space(20.0);
-                    ui.separator();
-                    ui.add_space(18.0);
-                    ui.label(
-                        RichText::new("Made for making.")
-                            .font(theme::italic(23.0))
-                            .color(self.palette.muted),
-                    );
-                    ui.label(
-                        RichText::new("Open tools. Endless possibilities.")
-                            .size(10.0)
-                            .color(self.palette.faint),
-                    );
-                    ui.add_space(18.0);
-                    if ui
-                        .link(
-                            RichText::new("Meet the Craft family ↗")
-                                .size(11.0)
-                                .color(self.palette.muted),
-                        )
-                        .clicked()
-                    {
-                        self.external("https://getartcraft.com/apps".into());
-                    }
-                });
             });
     }
     pub(crate) fn topbar(&mut self, ui: &mut Ui) {
@@ -104,6 +137,8 @@ impl Launcher {
                     Page::AllApps => "DISCOVER / CRAFT APPS",
                     Page::Updates => "WORKSPACE / UPDATES",
                     Page::Activity => "WORKSPACE / ACTIVITY",
+                    Page::Queue => "WORKSPACE / QUEUE",
+                    Page::Discover => "DISCOVER / NEW & LOCAL",
                     Page::Settings => "WORKSPACE / SETTINGS",
                 })
                 .monospace()
@@ -136,12 +171,17 @@ impl Launcher {
             ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(size)));
         } else {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect.shrink(2.0), 12.0, self.palette.accent);
+            let app = craftlauncher_core::app(id).ok();
+            let color = app
+                .map(|app| Color32::from_rgb(app.color[0], app.color[1], app.color[2]))
+                .unwrap_or(self.palette.accent);
+            ui.painter().rect_filled(rect.shrink(2.0), 12.0, color);
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "A",
+                app.and_then(|app| app.name.chars().next())
+                    .unwrap_or('A')
+                    .to_string(),
                 egui::FontId::proportional(size * 0.65),
                 Color32::WHITE,
             );
@@ -150,7 +190,7 @@ impl Launcher {
     fn primary(&self, ui: &mut Ui, text: &str, enabled: bool) -> bool {
         widgets::button(ui, self.palette, text, ButtonKind::Primary, enabled, 104.0).clicked()
     }
-    fn headline(&self, ui: &mut Ui, title: &str, description: &str) {
+    pub(crate) fn headline(&self, ui: &mut Ui, title: &str, description: &str) {
         ui.label(RichText::new(title).font(theme::display(43.0)));
         ui.add_space(6.0);
         ui.label(
@@ -194,6 +234,13 @@ impl Launcher {
                 "Your installed tools, together in one place.",
             );
         }
+        self.project_controls(ui, None);
+        ui.label(
+            RichText::new("Drop a project file here to choose a Craft app.")
+                .size(11.0)
+                .color(self.palette.muted),
+        );
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
             let filter_width = 186.0;
@@ -219,25 +266,17 @@ impl Launcher {
             }
             egui::ComboBox::from_id_salt("discipline")
                 .selected_text(
-                    [
-                        "All disciplines",
-                        "Image & design",
-                        "Video & motion",
-                        "Documents",
-                    ][self.discipline],
+                    self.discipline
+                        .checked_sub(1)
+                        .and_then(|index| DISCIPLINES.get(index))
+                        .copied()
+                        .unwrap_or("All categories"),
                 )
                 .width(filter_width)
                 .show_ui(ui, |ui| {
-                    for (index, label) in [
-                        "All disciplines",
-                        "Image & design",
-                        "Video & motion",
-                        "Documents",
-                    ]
-                    .iter()
-                    .enumerate()
-                    {
-                        ui.selectable_value(&mut self.discipline, index, *label);
+                    ui.selectable_value(&mut self.discipline, 0, "All categories");
+                    for (index, label) in DISCIPLINES.iter().enumerate() {
+                        ui.selectable_value(&mut self.discipline, index + 1, *label);
                     }
                 });
         });
@@ -247,17 +286,21 @@ impl Launcher {
             .into_iter()
             .filter(|app| {
                 let installed = self.snapshot.state.installations.contains_key(app.id);
-                let discipline = match self.discipline {
-                    1 => ["artcraft", "photocraft", "vectorcraft", "lightcraft"].contains(&app.id),
-                    2 => ["filmcraft", "effectcraft"].contains(&app.id),
-                    3 => ["printcraft", "designcraft"].contains(&app.id),
-                    _ => true,
-                };
+                let discipline = self.discipline == 0
+                    || DISCIPLINES
+                        .get(self.discipline - 1)
+                        .is_some_and(|label| *label == app.discipline);
                 (self.page == Page::AllApps || installed)
                     && discipline
-                    && format!("{} {} {}", app.name, app.category, app.tags.join(" "))
-                        .to_lowercase()
-                        .contains(&search)
+                    && format!(
+                        "{} {} {} {}",
+                        app.name,
+                        app.category,
+                        app.discipline,
+                        app.tags.join(" ")
+                    )
+                    .to_lowercase()
+                    .contains(&search)
             })
             .collect();
         apps.sort_by_key(|app| !self.preferences(app.id).favorite);
@@ -300,7 +343,7 @@ impl Launcher {
                         RichText::new(if self.search.is_empty() {
                             "Install a Craft app or link one you already have."
                         } else {
-                            "Try another name or discipline."
+                            "Try another name or category."
                         })
                         .color(self.palette.muted),
                     );
@@ -315,23 +358,40 @@ impl Launcher {
         self.batch_download_controls(ui, &apps);
         let columns = if ui.available_width() >= 620.0 { 2 } else { 1 };
         let width = (ui.available_width() - (columns - 1) as f32 * 14.0) / columns as f32;
-        for row in apps.chunks(columns) {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                for app in row {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(width, 182.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.scope_builder(
-                                egui::UiBuilder::new().id(egui::Id::new(("app-card", app.id))),
-                                |ui| self.card(ui, *app, width),
-                            );
-                        },
-                    );
-                }
-            });
-            ui.add_space(4.0);
+        for discipline in DISCIPLINES {
+            let grouped: Vec<App> = apps
+                .iter()
+                .copied()
+                .filter(|app| app.discipline == discipline)
+                .collect();
+            if grouped.is_empty() {
+                continue;
+            }
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(format!("{discipline} · {}", grouped.len()))
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(10.0);
+            for row in grouped.chunks(columns) {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    for app in row {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(width, 182.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.scope_builder(
+                                    egui::UiBuilder::new().id(egui::Id::new(("app-card", app.id))),
+                                    |ui| self.card(ui, *app, width),
+                                );
+                            },
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+            }
         }
         ui.add_space(18.0);
         ui.horizontal(|ui| {
@@ -402,7 +462,7 @@ impl Launcher {
                     self.palette,
                     &mut all,
                     "Select available",
-                    !eligible.is_empty() && !self.worker.busy(),
+                    !eligible.is_empty(),
                     partial,
                 )
                 .on_hover_text("Select all compatible packages in this view")
@@ -421,7 +481,7 @@ impl Launcher {
                     self.palette,
                     "Clear",
                     ButtonKind::Secondary,
-                    !self.worker.busy() && !self.selected_apps.is_empty(),
+                    !self.selected_apps.is_empty(),
                     64.0,
                 )
                 .clicked()
@@ -442,7 +502,7 @@ impl Launcher {
                         self.palette,
                         &text,
                         ButtonKind::Primary,
-                        !self.worker.busy() && !self.selected_apps.is_empty(),
+                        !self.selected_apps.is_empty(),
                         196.0,
                     )
                     .clicked()
@@ -612,7 +672,7 @@ impl Launcher {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if compatible {
                         let mut checked = selected;
-                        if widgets::checkbox(ui, self.palette, &mut checked, "", !self.worker.busy(), false).on_hover_text(format!("Select {} for download", app.name)).changed() {
+                        if widgets::checkbox(ui, self.palette, &mut checked, "", true, false).on_hover_text(format!("Select {} for download", app.name)).changed() {
                             if checked { self.selected_apps.insert(app.id.into()); } else { self.selected_apps.remove(app.id); }
                         }
                     }
@@ -652,9 +712,9 @@ impl Launcher {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.menu_button("···", |ui| self.app_menu(ui, app));
                     if installed.is_some() {
-                        if self.primary(ui, "Open", !self.worker.busy()) { self.command(Command::Launch(app.id.into())); }
+                        if self.primary(ui, "Open", true) { self.command(Command::Launch(app.id.into())); }
                     } else if compatible {
-                        if self.primary(ui, "Install", !self.worker.busy() && pending.is_none()) { self.command(Command::Install { id: app.id.into(), version: None }); }
+                        if self.primary(ui, "Install", pending.is_none()) { self.command(Command::Install { id: app.id.into(), version: None }); }
                     } else if web_only {
                         if widgets::button(ui, self.palette, "Open web ↗", ButtonKind::Secondary, true, 112.0).on_hover_text("This release has no compatible desktop package. Open ArtCraft's hosted web studio.").clicked() { self.external("https://app.getartcraft.com".into()); }
                     } else {
@@ -677,11 +737,14 @@ impl Launcher {
             ui.close();
         }
         if ui.button("View source ↗").clicked() {
-            self.external(format!("https://github.com/storytold/{}", app.id));
+            self.external(format!("https://github.com/storytold/{}", app.repository()));
             ui.close();
         }
         if ui.button("All releases ↗").clicked() {
-            self.external(format!("https://github.com/storytold/{}/releases", app.id));
+            self.external(format!(
+                "https://github.com/storytold/{}/releases",
+                app.repository()
+            ));
             ui.close();
         }
         ui.separator();
@@ -768,6 +831,14 @@ impl Launcher {
                 if let Some(hero) = self.assets.hero(app.id) { ui.add(egui::Image::new(hero).fit_to_exact_size(Vec2::new(ui.available_width(), ui.available_width()*0.50)).corner_radius(4)); ui.add_space(12.0); }
                 ui.horizontal(|ui| { self.app_icon(ui, app.id, 54.0); ui.vertical(|ui| { ui.label(RichText::new(app.name).font(theme::display(34.0))); ui.label(RichText::new(app.category).color(self.palette.muted)); }); });
                 ui.add_space(10.0); ui.label(app.detail);
+                ui.label(RichText::new(format!("{} · Experimental software", app.stage)).color(self.palette.muted));
+                let release_status = match self.release(app.id) {
+                    Some(release) if self.available(app.id) => format!("{} available for {} / {}", release.tag_name, self.snapshot.platform, self.snapshot.arch),
+                    Some(release) => format!("{} published · no package for {} / {}", release.tag_name, self.snapshot.platform, self.snapshot.arch),
+                    None => "No published release loaded. Refresh releases to check availability.".into(),
+                };
+                ui.label(release_status);
+                self.project_controls(ui, Some(app.id));
                 ui.horizontal_wrapped(|ui| { for tag in app.tags { ui.label(RichText::new(format!(" {tag} ")).size(10.0).background_color(self.palette.sunken).color(self.palette.muted)); } });
                 ui.add_space(12.0); ui.separator();
                 let mut preferences = self.preferences(app.id); let before = preferences.clone();
@@ -789,7 +860,7 @@ impl Launcher {
                 let versions = self.snapshot.state.releases.get(app.id).map(|r| r.versions.clone()).unwrap_or_default();
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("install_version").selected_text(if self.selected_version.is_empty() { "Choose a release" } else { &self.selected_version }).show_ui(ui, |ui| { for release in &versions { ui.selectable_value(&mut self.selected_version, release.tag_name.clone(), &release.tag_name); } });
-                    let can_install = !self.worker.busy() && !self.selected_version.is_empty() && versions.iter().find(|r| r.tag_name == self.selected_version).and_then(|r| asset_for(r, &self.snapshot.platform, &self.snapshot.arch)).is_some() && !self.snapshot.state.installations.get(app.id).is_some_and(|i| !i.managed) && !self.snapshot.state.pending.contains_key(app.id);
+                    let can_install = !self.selected_version.is_empty() && versions.iter().find(|r| r.tag_name == self.selected_version).and_then(|r| asset_for(r, &self.snapshot.platform, &self.snapshot.arch)).is_some() && !self.snapshot.state.installations.get(app.id).is_some_and(|i| !i.managed) && !self.snapshot.state.pending.contains_key(app.id);
                     if self.primary(ui, "Install version", can_install) { self.command(Command::Install { id: app.id.into(), version: Some(self.selected_version.clone()) }); }
                     if self.snapshot.state.installations.contains_key(app.id) && ui.add_enabled(!self.worker.busy(), egui::Button::new("Open app ↗")).clicked() { self.command(Command::Launch(app.id.into())); }
                 });
@@ -797,8 +868,8 @@ impl Launcher {
                 if let Some(error) = self.snapshot.state.releases.get(app.id).and_then(|r| r.error.as_ref()) { ui.label(RichText::new(error).color(self.palette.danger)); }
                 ui.collapsing("Release notes", |ui| { let notes = self.release(app.id).and_then(|r| r.body.clone()).unwrap_or_else(|| "No release notes loaded.".into()); ui.label(notes); });
                 ui.horizontal(|ui| {
-                    if ui.link("Source ↗").clicked() { self.external(format!("https://github.com/storytold/{}", app.id)); }
-                    if ui.link("Product website ↗").clicked() { self.external(if app.id == "artcraft" { "https://getartcraft.com".into() } else { format!("https://getartcraft.com/apps/{}", app.id) }); }
+                    if ui.link("Source ↗").clicked() { self.external(format!("https://github.com/storytold/{}", app.repository())); }
+                    if ui.link("Product website ↗").clicked() { self.external(if app.id == "artcraft" { "https://getartcraft.com".into() } else { format!("https://getartcraft.com/apps/{}", app.executable_name()) }); }
                     if app.id == "artcraft" && ui.link("Open web studio ↗").clicked() { self.external("https://app.getartcraft.com".into()); }
                     if let Some(asset) = self.release(app.id).and_then(|r| r.assets.iter().find(|a| a.name.contains("-web-") && a.name.ends_with(".zip"))).cloned()
                         && ui.link("Download WebAssembly build ↗").clicked() { self.external(asset.browser_download_url); }
@@ -962,6 +1033,15 @@ impl Launcher {
                 .color(self.palette.muted),
             );
         }
+        if ui
+            .add_enabled(
+                !craftlauncher_core::workspace::update_preview(&self.snapshot).is_empty(),
+                egui::Button::new("Update all…"),
+            )
+            .clicked()
+        {
+            self.review_updates();
+        }
         for app in apps {
             Frame::new()
                 .fill(self.palette.raised)
@@ -1030,7 +1110,7 @@ impl Launcher {
                                 if self.primary(
                                     ui,
                                     if pinned { "Pinned" } else { "Update" },
-                                    !self.worker.busy() && !pinned,
+                                    !pinned,
                                 ) {
                                     self.command(Command::Install {
                                         id: app.id.into(),

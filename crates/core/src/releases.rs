@@ -11,6 +11,9 @@ use std::{
 };
 
 pub trait Remote: Send {
+    fn discover(&self, _cancel: &AtomicBool) -> Result<Vec<crate::workspace::DiscoveredApp>> {
+        Ok(Vec::new())
+    }
     fn release(
         &self,
         id: &str,
@@ -45,7 +48,7 @@ impl Github {
 }
 
 pub fn trusted_asset_url(id: &str, raw: &str) -> Result<()> {
-    crate::app(id)?;
+    let repository = crate::app(id)?.repository();
     let url = reqwest::Url::parse(raw).map_err(|_| fail("Invalid download URL."))?;
     if url.scheme() != "https"
         || url.host_str() != Some("github.com")
@@ -54,7 +57,7 @@ pub fn trusted_asset_url(id: &str, raw: &str) -> Result<()> {
         || url.password().is_some()
         || !url
             .path()
-            .starts_with(&format!("/storytold/{id}/releases/download/"))
+            .starts_with(&format!("/storytold/{repository}/releases/download/"))
     {
         return Err(fail(
             "Downloads must come from the official storytold release.",
@@ -119,17 +122,42 @@ pub fn asset_for<'a>(release: &'a Release, platform: &str, arch: &str) -> Option
 }
 
 impl Remote for Github {
+    fn discover(&self, cancel: &AtomicBool) -> Result<Vec<crate::workspace::DiscoveredApp>> {
+        let mut found = Vec::new();
+        for page in 1..=10 {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(fail("Discovery cancelled."));
+            }
+            let repos: Vec<Repository> = self
+                .client
+                .get(format!(
+                    "https://api.github.com/users/storytold/repos?per_page=100&page={page}"
+                ))
+                .timeout(Duration::from_secs(25))
+                .header("Accept", "application/vnd.github+json")
+                .send()?
+                .error_for_status()?
+                .json()?;
+            let last = repos.len() < 100;
+            found.extend(discovery_candidates(repos));
+            if last {
+                break;
+            }
+        }
+        found.sort_by_key(|app| app.repository.to_ascii_lowercase());
+        Ok(found)
+    }
     fn release(
         &self,
         id: &str,
         channel: Channel,
         cached: Option<&ReleaseCache>,
     ) -> Result<ReleaseCache> {
-        crate::app(id)?;
+        let repository = crate::app(id)?.repository();
         let mut request = self
             .client
             .get(format!(
-                "https://api.github.com/repos/storytold/{id}/releases?per_page=30"
+                "https://api.github.com/repos/storytold/{repository}/releases?per_page=30"
             ))
             .timeout(Duration::from_secs(25))
             .header("Accept", "application/vnd.github+json");
@@ -247,6 +275,45 @@ impl Remote for Github {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct Repository {
+    name: String,
+    full_name: String,
+    description: Option<String>,
+    fork: bool,
+    archived: bool,
+    disabled: bool,
+}
+fn discovery_candidates(repos: Vec<Repository>) -> Vec<crate::workspace::DiscoveredApp> {
+    repos
+        .into_iter()
+        .filter(|repo| {
+            let name = repo.name.to_ascii_lowercase();
+            !repo.fork
+                && !repo.archived
+                && !repo.disabled
+                && name.ends_with("craft")
+                && repo
+                    .name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                && repo.full_name == format!("storytold/{}", repo.name)
+                && !crate::CATALOG
+                    .iter()
+                    .any(|app| app.repository().eq_ignore_ascii_case(&repo.name))
+        })
+        .map(|repo| crate::workspace::DiscoveredApp {
+            repository: repo.name,
+            description: repo
+                .description
+                .unwrap_or_default()
+                .chars()
+                .take(400)
+                .collect(),
+        })
+        .collect()
+}
+
 fn valid_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
 }
@@ -289,6 +356,57 @@ mod tests {
                     digest: None,
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn discovery_excludes_known_apps_forks_archives_and_untrusted_owners() {
+        let repos: Vec<Repository> = serde_json::from_value(serde_json::json!([
+            {"name":"NewCraft","full_name":"storytold/NewCraft","description":"New app","fork":false,"archived":false,"disabled":false},
+            {"name":"pdfcraft","full_name":"storytold/pdfcraft","description":null,"fork":false,"archived":false,"disabled":false},
+            {"name":"AniCraft","full_name":"storytold/AniCraft","description":null,"fork":false,"archived":false,"disabled":false},
+            {"name":"oldcraft","full_name":"storytold/oldcraft","description":null,"fork":false,"archived":true,"disabled":false},
+            {"name":"forkcraft","full_name":"storytold/forkcraft","description":null,"fork":true,"archived":false,"disabled":false},
+            {"name":"evilcraft","full_name":"other/evilcraft","description":null,"fork":false,"archived":false,"disabled":false},
+            {"name":"craft-libs","full_name":"storytold/craft-libs","description":null,"fork":false,"archived":false,"disabled":false}
+        ])).unwrap();
+        let candidates = discovery_candidates(repos);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].repository, "NewCraft");
+    }
+
+    #[test]
+    fn renamed_pdfcraft_downloads_remain_bound_to_the_official_repository() {
+        assert!(
+            trusted_asset_url(
+                "printcraft",
+                "https://github.com/storytold/pdfcraft/releases/download/v0.9.0/pdfcraft.zip"
+            )
+            .is_ok()
+        );
+        for url in [
+            "https://github.com/storytold/wordcraft/releases/download/v1/app.zip",
+            "https://github.com/other/pdfcraft/releases/download/v1/app.zip",
+            "https://github.com/storytold/pdfcraft-extra/releases/download/v1/app.zip",
+            "https://evil.test/storytold/pdfcraft/releases/download/v1/app.zip",
+        ] {
+            assert!(trusted_asset_url("printcraft", url).is_err());
+        }
+    }
+
+    #[test]
+    fn every_catalog_app_has_a_trusted_release_source() {
+        for app in crate::CATALOG {
+            assert!(
+                trusted_asset_url(
+                    app.id,
+                    &format!(
+                        "https://github.com/storytold/{}/releases/download/v1/app.zip",
+                        app.repository()
+                    )
+                )
+                .is_ok()
+            );
         }
     }
 

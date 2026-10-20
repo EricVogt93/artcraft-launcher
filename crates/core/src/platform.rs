@@ -36,6 +36,11 @@ pub trait Platform: Send {
     fn arch(&self) -> &str;
     fn is_running(&self, executable: &Path) -> Result<bool>;
     fn launch(&self, executable: &Path) -> Result<Option<u32>>;
+    fn open_project(&self, _executable: &Path, _project: &Path) -> Result<Option<u32>> {
+        Err(fail(
+            "Opening project files is unavailable on this platform.",
+        ))
+    }
     /// Returns (path to the app, optional deferred installer), both relative to staging.
     fn unpack(
         &self,
@@ -129,6 +134,38 @@ impl Platform for Native {
         });
         Ok(Some(pid))
     }
+    fn open_project(&self, executable: &Path, project: &Path) -> Result<Option<u32>> {
+        if !executable.exists() || !project.is_file() {
+            return Err(fail("The application or project file is missing."));
+        }
+        #[cfg(target_os = "macos")]
+        if executable.extension().is_some_and(|ext| ext == "app") {
+            let status = Command::new("/usr/bin/open")
+                .arg("-a")
+                .arg(executable)
+                .arg(project)
+                .status()?;
+            if !status.success() {
+                return Err(fail("macOS could not open this project."));
+            }
+            return Ok(None);
+        }
+        let mut command = Command::new(executable);
+        command
+            .arg(project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if executable.extension().is_some_and(|ext| ext == "AppImage") {
+            command.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+        }
+        let mut child = command.spawn()?;
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(Some(pid))
+    }
     fn unpack(
         &self,
         id: &str,
@@ -137,6 +174,8 @@ impl Platform for Native {
         stage: &Path,
         cancel: &AtomicBool,
     ) -> Result<(PathBuf, Option<PathBuf>)> {
+        let legacy_id = id;
+        let id = crate::app(id)?.executable_name();
         let payload = stage.join("payload");
         fs::create_dir_all(&payload)?;
         match kind {
@@ -182,9 +221,10 @@ impl Platform for Native {
             }
         }
         let executable = if self.os() == "macos" {
-            installer::find_bundle(&payload, id)?
+            installer::find_bundle(&payload, id)?.or(installer::find_bundle(&payload, legacy_id)?)
         } else {
             installer::find_executable(&payload, id)?
+                .or(installer::find_executable(&payload, legacy_id)?)
         }
         .ok_or_else(|| fail(format!("The release has no {id} application.")))?;
         if self.os() != "macos" {

@@ -145,6 +145,10 @@ pub struct State {
     pub activity: Vec<Activity>,
     pub launcher_update: Option<crate::self_update::PreparedUpdate>,
     pub failed_launcher_version: Option<String>,
+    pub recent_projects: Vec<crate::workspace::RecentProject>,
+    pub discovered_apps: Vec<crate::workspace::DiscoveredApp>,
+    pub discovery_checked_at: Option<String>,
+    pub discovery_error: Option<String>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -158,6 +162,10 @@ impl Default for State {
             activity: Vec::new(),
             launcher_update: None,
             failed_launcher_version: None,
+            recent_projects: Vec::new(),
+            discovered_apps: Vec::new(),
+            discovery_checked_at: None,
+            discovery_error: None,
         }
     }
 }
@@ -200,6 +208,16 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_library_states_default_to_empty_workspace_history_and_discovery() {
+        let state: State =
+            serde_json::from_str(r#"{"schema":1,"settings":{"theme":"dark"}}"#).unwrap();
+        assert!(state.recent_projects.is_empty());
+        assert!(state.discovered_apps.is_empty());
+        assert!(state.discovery_checked_at.is_none());
+        assert_eq!(state.settings.theme, Theme::Dark);
+    }
 
     #[test]
     fn legacy_settings_keep_defaults_for_new_update_options() {

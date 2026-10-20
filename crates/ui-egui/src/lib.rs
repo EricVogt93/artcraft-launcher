@@ -4,6 +4,7 @@ mod tray;
 mod views;
 mod widgets;
 mod window;
+mod workflows;
 
 use assets::Assets;
 pub use assets::LOGO_PNG;
@@ -26,6 +27,8 @@ pub enum Page {
     AllApps,
     Updates,
     Activity,
+    Queue,
+    Discover,
     Settings,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +42,7 @@ pub struct HealthCheck {
     pub expected_version: String,
 }
 pub struct Launcher {
+    workflows: workflows::Workflows,
     worker: Worker,
     snapshot: Snapshot,
     assets: Assets,
@@ -96,6 +100,7 @@ impl Launcher {
         let launcher = std::env::current_exe().unwrap_or_default();
         let worker = Worker::new(manager, launcher);
         Self {
+            workflows: workflows::Workflows::default(),
             worker,
             snapshot,
             assets: Assets::load(&cc.egui_ctx),
@@ -123,6 +128,17 @@ impl Launcher {
         }
     }
     fn command(&mut self, command: Command) {
+        if matches!(
+            command,
+            Command::Install { .. }
+                | Command::UpdateReviewed { .. }
+                | Command::DownloadSelected { .. }
+                | Command::OpenProject { .. }
+                | Command::Launch(_)
+        ) {
+            self.enqueue(command);
+            return;
+        }
         if let Err(e) = self.worker.send(command) {
             self.toast = Some((e.to_string(), true, Instant::now()));
         }
@@ -142,7 +158,25 @@ impl Launcher {
         while let Ok(event) = self.worker.events.try_recv() {
             match event {
                 Event::State(snapshot) => self.snapshot = *snapshot,
+                Event::LocalApps(apps) => self.workflows.local = apps,
                 Event::Progress(progress) => self.progress = Some(progress),
+                Event::TaskFinished { id, result } => {
+                    if self.workflows.active == Some(id) {
+                        self.workflows.active = None;
+                        self.workflows.tasks[id].status = match &result {
+                            Ok(_) => workflows::TaskStatus::Done,
+                            Err(error) if error.to_ascii_lowercase().contains("cancelled") => {
+                                workflows::TaskStatus::Cancelled
+                            }
+                            Err(error) => workflows::TaskStatus::Failed(error.clone()),
+                        };
+                    }
+                    self.progress = None;
+                    self.toast = Some(match result {
+                        Ok(message) => (message, false, Instant::now()),
+                        Err(message) => (message, true, Instant::now()),
+                    });
+                }
                 Event::Finished(result) => {
                     self.progress = None;
                     self.toast = Some(match result {
@@ -150,6 +184,14 @@ impl Launcher {
                         Err(message) => (message, true, Instant::now()),
                     });
                 }
+            }
+        }
+        self.dispatch_task();
+        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        for file in dropped {
+            let path = file.path();
+            if path.is_file() {
+                self.workflows.projects.push(path.to_path_buf());
             }
         }
         self.palette = theme::apply(ctx, self.snapshot.state.settings.theme);
@@ -351,11 +393,14 @@ impl eframe::App for Launcher {
                         Page::AllApps | Page::MyApps => self.apps(ui),
                         Page::Updates => self.updates(ui, &ctx),
                         Page::Activity => self.activity(ui),
+                        Page::Queue => self.queue_page(ui),
+                        Page::Discover => self.discovery_page(ui),
                         Page::Settings => self.settings(ui),
                     });
             });
         self.details(&ctx);
         self.remove_dialog(&ctx);
+        self.workflow_dialogs(&ctx);
         if self.first_frame {
             self.first_frame = false;
             ctx.request_repaint();
