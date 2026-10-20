@@ -122,3 +122,12 @@ Source code is [Apache-2.0](LICENSE), preserving this repository’s original li
 Eric Vogt develops only CraftLauncher and is not affiliated with ArtCraft, Storytold or any of the applications it manages. Those applications are developed and supported independently by their respective owners. The repository presentation is inspired by [ArtCraft](https://github.com/storytold/artcraft). The original launcher [logo](assets/craftlauncher-logo.png) and its generation prompt are documented in [branding](assets/BRANDING.md).
 
 The launcher keeps `printcraft` as the local ID for PdfCraft to preserve existing installations and settings. Downloads use the official `storytold/pdfcraft` repository. AniCraft currently has no published releases; it can be linked to a local build.
+
+### Workspace workflows
+
+- **Updates → Update all…** previews installed and available versions and total download size. Choose individual updates; pinned apps stay excluded. Verified updates wait for running apps to close.
+- **Queue** runs installations and package downloads sequentially, with per-item progress, cancellation and retry. Other items continue after a failure. The queue is session-only; closing the launcher cancels unfinished work.
+- **Open project file…**, or drop one or more files onto the launcher, to choose an installed Craft app. Suggestions follow the file extension; actual format support depends on the app version. Recent projects are saved locally and can be cleared.
+- **Discover** scans PATH and common application folders at startup or on demand. Review a detected executable before linking it. Managed launcher wrappers are excluded.
+- Product discovery checks public, active, non-fork `*craft` repositories under `storytold` during release refreshes, normally every six hours while the launcher is running. New candidates link to their repositories and releases for review. Offline checks preserve previous results.
+- Product details include upstream artwork where available, experimental status, release and OS/CPU availability. AniCraft currently has no bundled screenshot.

@@ -4,6 +4,12 @@ This changelog describes the launcher only. Changes to third-party apps are publ
 
 ## Unreleased
 
+- Add an update review with selectable apps, version comparisons, download totals and version-pin protection.
+- Queue installations and package downloads with per-item progress, cancellation, failure isolation and retries.
+- Open dropped project files in a selected Craft app and keep a clearable local recent-project history.
+- Discover local Craft installations and new public products on the official GitHub account.
+- Bundle official icons and screenshots for additional products and show release/platform availability in product details.
+
 - Group tools into eight categories with shared catalog metadata, category filters and searchable category names.
 
 - Add AniCraft, CADCraft, DeckCraft, FigCraft, GridCraft, SoundCraft and WordCraft to the app catalog and discipline filters.

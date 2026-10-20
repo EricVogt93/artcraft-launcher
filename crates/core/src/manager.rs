@@ -643,6 +643,63 @@ impl Manager {
         self.save()?;
         Ok(pid)
     }
+    pub fn open_project(&mut self, id: &str, path: PathBuf) -> Result<()> {
+        crate::app(id)?;
+        let path = fs::canonicalize(path)?;
+        if !path.is_file() {
+            return Err(fail("Select a project file."));
+        }
+        let install = self
+            .state
+            .installations
+            .get(id)
+            .ok_or_else(|| fail("Install or link this app first."))?;
+        let executable = self.executable(id, install)?;
+        self.platform.open_project(&executable, &path)?;
+        self.state
+            .recent_projects
+            .retain(|p| p.path != path || p.app_id != id);
+        self.state.recent_projects.insert(
+            0,
+            crate::workspace::RecentProject {
+                path,
+                app_id: id.into(),
+                opened_at: now(),
+            },
+        );
+        self.state.recent_projects.truncate(30);
+        if let Some(install) = self.state.installations.get_mut(id) {
+            install.last_opened_at = Some(now());
+        }
+        self.record(Some(id), "open project", "Project opened.", false);
+        self.save()
+    }
+    pub fn discover_products(&mut self, cancel: &AtomicBool) -> Result<()> {
+        match self.remote.discover(cancel) {
+            Ok(apps) => {
+                self.state.discovered_apps = apps;
+                self.state.discovery_checked_at = Some(now());
+                self.state.discovery_error = None;
+            }
+            Err(error) => {
+                self.state.discovery_error = Some(error.to_string());
+            }
+        }
+        self.save()
+    }
+    pub fn update_reviewed(
+        &mut self,
+        id: &str,
+        version: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<()> {
+        crate::workspace::update_preview(&self.snapshot())
+            .into_iter()
+            .find(|p| p.app_id == id && p.next == version && !p.pinned)
+            .ok_or_else(|| fail("This update is no longer eligible. Review updates again."))?;
+        self.stage_install(id, None, cancel, progress)
+    }
     pub fn stage_install(
         &mut self,
         id: &str,

@@ -13,9 +13,15 @@ use std::{
 #[derive(Debug, Clone)]
 pub enum Command {
     Refresh,
+    Queued { id: usize, command: Box<Command> },
     Install { id: String, version: Option<String> },
+    UpdateReviewed { id: String, version: String },
     DownloadSelected { ids: Vec<String>, folder: PathBuf },
     Launch(String),
+    OpenProject { id: String, path: PathBuf },
+    Discover,
+    ScanLocal,
+    ClearRecent,
     Link(String, PathBuf),
     Remove(String),
     Rollback(String),
@@ -32,6 +38,11 @@ pub enum Event {
     State(Box<Snapshot>),
     Progress(Progress),
     Finished(std::result::Result<String, String>),
+    LocalApps(Vec<crate::workspace::LocalApp>),
+    TaskFinished {
+        id: usize,
+        result: std::result::Result<String, String>,
+    },
 }
 pub struct Worker {
     pub events: Receiver<Event>,
@@ -112,6 +123,11 @@ fn run(
     };
     let mut next_activation = Instant::now() + Duration::from_secs(15);
     let _ = send.send(Event::State(Box::new(manager.snapshot())));
+    let local = crate::workspace::discover_local(
+        &crate::workspace::local_search_roots(),
+        &manager.snapshot(),
+    );
+    let _ = send.send(Event::LocalApps(local));
     loop {
         let command = match commands.recv_timeout(Duration::from_secs(1)) {
             Ok(Command::Shutdown) => break,
@@ -120,10 +136,19 @@ fn run(
             Err(mpsc::RecvTimeoutError::Timeout) => None,
         };
         if let Some(command) = command {
+            let (command, task_id) = match command {
+                Command::Queued { id, command } => (*command, Some(id)),
+                command => (command, None),
+            };
             let refresh = matches!(command, Command::Refresh);
             let result = execute(&mut manager, command, &launcher, &cancel, &send);
             let _ = send.send(Event::State(Box::new(manager.snapshot())));
-            let _ = send.send(Event::Finished(result.map_err(|e| e.to_string())));
+            let result = result.map_err(|e| e.to_string());
+            let event = match task_id {
+                Some(id) => Event::TaskFinished { id, result },
+                None => Event::Finished(result),
+            };
+            let _ = send.send(event);
             busy.store(false, Ordering::Release);
             // An explicit refresh satisfies the periodic check too.
             if refresh {
@@ -170,9 +195,14 @@ fn execute(
         }
         Command::Refresh => {
             manager.refresh_all(cancel, &mut changed)?;
+            manager.discover_products(cancel)?;
             manager.auto_updates(cancel, &mut progress, &mut changed)?;
             manager.check_launcher_update(false, cancel)?;
             Ok("Release check complete.".into())
+        }
+        Command::UpdateReviewed { id, version } => {
+            manager.update_reviewed(&id, &version, cancel, &mut progress)?;
+            Ok("Update verified. Running apps activate after closing.".into())
         }
         Command::Install { id, version } => {
             manager.stage_install(&id, version.as_deref(), cancel, &mut progress)?;
@@ -181,6 +211,31 @@ fn execute(
             } else {
                 "App ready.".into()
             })
+        }
+        Command::ClearRecent => {
+            manager.state.recent_projects.clear();
+            manager.save()?;
+            Ok("Recent project history cleared.".into())
+        }
+        Command::Discover => {
+            manager.discover_products(cancel)?;
+            if let Some(error) = &manager.state.discovery_error {
+                return Err(fail(error));
+            }
+            Ok("GitHub product discovery complete.".into())
+        }
+        Command::ScanLocal => {
+            let apps = crate::workspace::discover_local(
+                &crate::workspace::local_search_roots(),
+                &manager.snapshot(),
+            );
+            let count = apps.len();
+            let _ = send.send(Event::LocalApps(apps));
+            Ok(format!("Found {count} local installations."))
+        }
+        Command::OpenProject { id, path } => {
+            manager.open_project(&id, path)?;
+            Ok("Project opened.".into())
         }
         Command::Launch(id) => {
             manager.launch(&id)?;
@@ -234,6 +289,7 @@ fn execute(
             manager.activate_all_pending()?;
             Ok("Pending updates checked.".into())
         }
+        Command::Queued { .. } => Err(fail("Nested queue commands are unsupported.")),
         Command::Shutdown => Ok(String::new()),
     }
 }

@@ -9,6 +9,7 @@ pub mod platform;
 pub mod releases;
 pub mod self_update;
 pub mod worker;
+pub mod workspace;
 
 pub use catalog::{App, CATALOG, app};
 pub use manager::Manager;
