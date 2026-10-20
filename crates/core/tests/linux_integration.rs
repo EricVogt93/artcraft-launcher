@@ -146,3 +146,36 @@ fn appimage_is_extracted_once_and_its_native_entry_runs_without_the_image() {
     );
     assert!(!cancelled_stage.join("payload/squashfs-root").exists());
 }
+
+#[test]
+fn renamed_pdfcraft_tar_finds_the_new_executable_under_the_existing_launcher_id() {
+    use craftlauncher_core::platform::{PackageKind, Platform};
+    use std::sync::atomic::AtomicBool;
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("pdfcraft.tar.gz");
+    let file = fs::File::create(&archive).unwrap();
+    let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::default(),
+    ));
+    let contents = b"#!/bin/sh\nexit 0\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o755);
+    header.set_cksum();
+    tar.append_data(&mut header, "pdfcraft", &contents[..])
+        .unwrap();
+    tar.into_inner().unwrap().finish().unwrap();
+    let stage = tmp.path().join("stage");
+    let (entry, _) = craftlauncher_core::platform::Native
+        .unpack(
+            "printcraft",
+            PackageKind::TarGz,
+            &archive,
+            &stage,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(entry, std::path::PathBuf::from("payload/pdfcraft"));
+    assert!(stage.join(entry).is_file());
+}

@@ -137,6 +137,8 @@ impl Platform for Native {
         stage: &Path,
         cancel: &AtomicBool,
     ) -> Result<(PathBuf, Option<PathBuf>)> {
+        let legacy_id = id;
+        let id = crate::app(id)?.executable_name();
         let payload = stage.join("payload");
         fs::create_dir_all(&payload)?;
         match kind {
@@ -182,9 +184,10 @@ impl Platform for Native {
             }
         }
         let executable = if self.os() == "macos" {
-            installer::find_bundle(&payload, id)?
+            installer::find_bundle(&payload, id)?.or(installer::find_bundle(&payload, legacy_id)?)
         } else {
             installer::find_executable(&payload, id)?
+                .or(installer::find_executable(&payload, legacy_id)?)
         }
         .ok_or_else(|| fail(format!("The release has no {id} application.")))?;
         if self.os() != "macos" {

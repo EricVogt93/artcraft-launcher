@@ -3,8 +3,8 @@ use crate::{
     widgets::{self, ButtonKind, CONTROL_HEIGHT},
 };
 use craftlauncher_core::{
-    App, AppPreferences, CATALOG, Channel, Command, Theme, model::is_newer, releases::asset_for,
-    self_update,
+    App, AppPreferences, CATALOG, Channel, Command, Theme, catalog::DISCIPLINES, model::is_newer,
+    releases::asset_for, self_update,
 };
 use egui::{Align, Color32, Context, Frame, Layout, RichText, Stroke, Ui, Vec2};
 use std::time::Instant;
@@ -136,12 +136,17 @@ impl Launcher {
             ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(size)));
         } else {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect.shrink(2.0), 12.0, self.palette.accent);
+            let app = craftlauncher_core::app(id).ok();
+            let color = app
+                .map(|app| Color32::from_rgb(app.color[0], app.color[1], app.color[2]))
+                .unwrap_or(self.palette.accent);
+            ui.painter().rect_filled(rect.shrink(2.0), 12.0, color);
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "A",
+                app.and_then(|app| app.name.chars().next())
+                    .unwrap_or('A')
+                    .to_string(),
                 egui::FontId::proportional(size * 0.65),
                 Color32::WHITE,
             );
@@ -219,25 +224,17 @@ impl Launcher {
             }
             egui::ComboBox::from_id_salt("discipline")
                 .selected_text(
-                    [
-                        "All disciplines",
-                        "Image & design",
-                        "Video & motion",
-                        "Documents",
-                    ][self.discipline],
+                    self.discipline
+                        .checked_sub(1)
+                        .and_then(|index| DISCIPLINES.get(index))
+                        .copied()
+                        .unwrap_or("All categories"),
                 )
                 .width(filter_width)
                 .show_ui(ui, |ui| {
-                    for (index, label) in [
-                        "All disciplines",
-                        "Image & design",
-                        "Video & motion",
-                        "Documents",
-                    ]
-                    .iter()
-                    .enumerate()
-                    {
-                        ui.selectable_value(&mut self.discipline, index, *label);
+                    ui.selectable_value(&mut self.discipline, 0, "All categories");
+                    for (index, label) in DISCIPLINES.iter().enumerate() {
+                        ui.selectable_value(&mut self.discipline, index + 1, *label);
                     }
                 });
         });
@@ -247,17 +244,21 @@ impl Launcher {
             .into_iter()
             .filter(|app| {
                 let installed = self.snapshot.state.installations.contains_key(app.id);
-                let discipline = match self.discipline {
-                    1 => ["artcraft", "photocraft", "vectorcraft", "lightcraft"].contains(&app.id),
-                    2 => ["filmcraft", "effectcraft"].contains(&app.id),
-                    3 => ["printcraft", "designcraft"].contains(&app.id),
-                    _ => true,
-                };
+                let discipline = self.discipline == 0
+                    || DISCIPLINES
+                        .get(self.discipline - 1)
+                        .is_some_and(|label| *label == app.discipline);
                 (self.page == Page::AllApps || installed)
                     && discipline
-                    && format!("{} {} {}", app.name, app.category, app.tags.join(" "))
-                        .to_lowercase()
-                        .contains(&search)
+                    && format!(
+                        "{} {} {} {}",
+                        app.name,
+                        app.category,
+                        app.discipline,
+                        app.tags.join(" ")
+                    )
+                    .to_lowercase()
+                    .contains(&search)
             })
             .collect();
         apps.sort_by_key(|app| !self.preferences(app.id).favorite);
@@ -300,7 +301,7 @@ impl Launcher {
                         RichText::new(if self.search.is_empty() {
                             "Install a Craft app or link one you already have."
                         } else {
-                            "Try another name or discipline."
+                            "Try another name or category."
                         })
                         .color(self.palette.muted),
                     );
@@ -315,23 +316,40 @@ impl Launcher {
         self.batch_download_controls(ui, &apps);
         let columns = if ui.available_width() >= 620.0 { 2 } else { 1 };
         let width = (ui.available_width() - (columns - 1) as f32 * 14.0) / columns as f32;
-        for row in apps.chunks(columns) {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                for app in row {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(width, 182.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.scope_builder(
-                                egui::UiBuilder::new().id(egui::Id::new(("app-card", app.id))),
-                                |ui| self.card(ui, *app, width),
-                            );
-                        },
-                    );
-                }
-            });
-            ui.add_space(4.0);
+        for discipline in DISCIPLINES {
+            let grouped: Vec<App> = apps
+                .iter()
+                .copied()
+                .filter(|app| app.discipline == discipline)
+                .collect();
+            if grouped.is_empty() {
+                continue;
+            }
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(format!("{discipline} · {}", grouped.len()))
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(10.0);
+            for row in grouped.chunks(columns) {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    for app in row {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(width, 182.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.scope_builder(
+                                    egui::UiBuilder::new().id(egui::Id::new(("app-card", app.id))),
+                                    |ui| self.card(ui, *app, width),
+                                );
+                            },
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+            }
         }
         ui.add_space(18.0);
         ui.horizontal(|ui| {
@@ -677,11 +695,14 @@ impl Launcher {
             ui.close();
         }
         if ui.button("View source ↗").clicked() {
-            self.external(format!("https://github.com/storytold/{}", app.id));
+            self.external(format!("https://github.com/storytold/{}", app.repository()));
             ui.close();
         }
         if ui.button("All releases ↗").clicked() {
-            self.external(format!("https://github.com/storytold/{}/releases", app.id));
+            self.external(format!(
+                "https://github.com/storytold/{}/releases",
+                app.repository()
+            ));
             ui.close();
         }
         ui.separator();
@@ -797,8 +818,8 @@ impl Launcher {
                 if let Some(error) = self.snapshot.state.releases.get(app.id).and_then(|r| r.error.as_ref()) { ui.label(RichText::new(error).color(self.palette.danger)); }
                 ui.collapsing("Release notes", |ui| { let notes = self.release(app.id).and_then(|r| r.body.clone()).unwrap_or_else(|| "No release notes loaded.".into()); ui.label(notes); });
                 ui.horizontal(|ui| {
-                    if ui.link("Source ↗").clicked() { self.external(format!("https://github.com/storytold/{}", app.id)); }
-                    if ui.link("Product website ↗").clicked() { self.external(if app.id == "artcraft" { "https://getartcraft.com".into() } else { format!("https://getartcraft.com/apps/{}", app.id) }); }
+                    if ui.link("Source ↗").clicked() { self.external(format!("https://github.com/storytold/{}", app.repository())); }
+                    if ui.link("Product website ↗").clicked() { self.external(if app.id == "artcraft" { "https://getartcraft.com".into() } else { format!("https://getartcraft.com/apps/{}", app.executable_name()) }); }
                     if app.id == "artcraft" && ui.link("Open web studio ↗").clicked() { self.external("https://app.getartcraft.com".into()); }
                     if let Some(asset) = self.release(app.id).and_then(|r| r.assets.iter().find(|a| a.name.contains("-web-") && a.name.ends_with(".zip"))).cloned()
                         && ui.link("Download WebAssembly build ↗").clicked() { self.external(asset.browser_download_url); }

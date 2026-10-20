@@ -2,6 +2,13 @@
 
 This changelog describes the launcher only. Changes to third-party apps are published by their own developers.
 
+## Unreleased
+
+- Group tools into eight categories with shared catalog metadata, category filters and searchable category names.
+
+- Add AniCraft, CADCraft, DeckCraft, FigCraft, GridCraft, SoundCraft and WordCraft to the app catalog and discipline filters.
+- Follow the PrintCraft rename to PdfCraft for release downloads and executable detection while retaining existing local settings and installations.
+
 ## 0.1.0 — 2026-10-07
 
 ### Your creative workspace

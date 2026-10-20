@@ -45,7 +45,7 @@ impl Github {
 }
 
 pub fn trusted_asset_url(id: &str, raw: &str) -> Result<()> {
-    crate::app(id)?;
+    let repository = crate::app(id)?.repository();
     let url = reqwest::Url::parse(raw).map_err(|_| fail("Invalid download URL."))?;
     if url.scheme() != "https"
         || url.host_str() != Some("github.com")
@@ -54,7 +54,7 @@ pub fn trusted_asset_url(id: &str, raw: &str) -> Result<()> {
         || url.password().is_some()
         || !url
             .path()
-            .starts_with(&format!("/storytold/{id}/releases/download/"))
+            .starts_with(&format!("/storytold/{repository}/releases/download/"))
     {
         return Err(fail(
             "Downloads must come from the official storytold release.",
@@ -125,11 +125,11 @@ impl Remote for Github {
         channel: Channel,
         cached: Option<&ReleaseCache>,
     ) -> Result<ReleaseCache> {
-        crate::app(id)?;
+        let repository = crate::app(id)?.repository();
         let mut request = self
             .client
             .get(format!(
-                "https://api.github.com/repos/storytold/{id}/releases?per_page=30"
+                "https://api.github.com/repos/storytold/{repository}/releases?per_page=30"
             ))
             .timeout(Duration::from_secs(25))
             .header("Accept", "application/vnd.github+json");
@@ -289,6 +289,41 @@ mod tests {
                     digest: None,
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn renamed_pdfcraft_downloads_remain_bound_to_the_official_repository() {
+        assert!(
+            trusted_asset_url(
+                "printcraft",
+                "https://github.com/storytold/pdfcraft/releases/download/v0.9.0/pdfcraft.zip"
+            )
+            .is_ok()
+        );
+        for url in [
+            "https://github.com/storytold/wordcraft/releases/download/v1/app.zip",
+            "https://github.com/other/pdfcraft/releases/download/v1/app.zip",
+            "https://github.com/storytold/pdfcraft-extra/releases/download/v1/app.zip",
+            "https://evil.test/storytold/pdfcraft/releases/download/v1/app.zip",
+        ] {
+            assert!(trusted_asset_url("printcraft", url).is_err());
+        }
+    }
+
+    #[test]
+    fn every_catalog_app_has_a_trusted_release_source() {
+        for app in crate::CATALOG {
+            assert!(
+                trusted_asset_url(
+                    app.id,
+                    &format!(
+                        "https://github.com/storytold/{}/releases/download/v1/app.zip",
+                        app.repository()
+                    )
+                )
+                .is_ok()
+            );
         }
     }
 
