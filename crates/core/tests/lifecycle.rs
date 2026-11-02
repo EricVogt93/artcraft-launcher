@@ -1167,7 +1167,7 @@ fn project_arguments_are_literal_and_recent_history_survives_reload() {
     let project = fs::canonicalize(project).unwrap();
     manager.open_project("photocraft", project.clone()).unwrap();
     for _ in 0..100 {
-        if record.exists() {
+        if fs::read_to_string(&record).is_ok_and(|value| value == project.display().to_string()) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
