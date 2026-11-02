@@ -348,3 +348,247 @@ mod tests {
         assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
     }
 }
+
+/// Resolve a payload entry without evaluating desktop-file commands or shell syntax.
+/// Explicit paths and discovered candidates must stay inside the extracted payload.
+pub fn resolve_entrypoint(
+    root: &Path,
+    names: &[&str],
+    explicit: Option<&str>,
+    macos: bool,
+) -> Result<PathBuf> {
+    use std::collections::BTreeSet;
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        macos: bool,
+        depth: usize,
+        files: &mut Vec<PathBuf>,
+        bundles: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        if depth > 32 || files.len() + bundles.len() > MAX_FILES {
+            return Err(fail("Too many application files."));
+        }
+        for entry in fs::read_dir(dir)? {
+            if files.len() + bundles.len() >= MAX_FILES {
+                return Err(fail("Too many application files."));
+            }
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let path = entry.path();
+            if ty.is_file() {
+                files.push(
+                    path.strip_prefix(root)
+                        .map_err(|_| fail("Invalid package path."))?
+                        .to_path_buf(),
+                );
+            } else if ty.is_dir() {
+                if macos
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+                {
+                    bundles.push(
+                        path.strip_prefix(root)
+                            .map_err(|_| fail("Invalid package path."))?
+                            .to_path_buf(),
+                    );
+                } else {
+                    walk(root, &path, macos, depth + 1, files, bundles)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn checked(root: &Path, relative: &Path, macos: bool) -> Result<PathBuf> {
+        if !safe_native_relative(relative) {
+            return Err(fail("Invalid application entry path."));
+        }
+        let path = root.join(relative);
+        let metadata = path.symlink_metadata()?;
+        if metadata.file_type().is_symlink()
+            || !(metadata.is_file()
+                || (macos
+                    && metadata.is_dir()
+                    && path
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("app"))))
+        {
+            return Err(fail("The selected entry is not an application file."));
+        }
+        if !path.canonicalize()?.starts_with(root.canonicalize()?) {
+            return Err(fail("The application entry escapes the package."));
+        }
+        Ok(path)
+    }
+    if let Some(path) = explicit.filter(|s| !s.is_empty()) {
+        return checked(root, Path::new(path), macos);
+    }
+    let mut files = Vec::new();
+    let mut bundles = Vec::new();
+    walk(root, root, macos, 0, &mut files, &mut bundles)?;
+    let mut matches = BTreeSet::new();
+    if macos {
+        for bundle in &bundles {
+            let name = bundle.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+            if names
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+            {
+                matches.insert(bundle.clone());
+            }
+        }
+        if matches.is_empty() && bundles.len() == 1 {
+            matches.insert(bundles[0].clone());
+        }
+        if matches.is_empty() {
+            matches.extend(bundles);
+        }
+    } else {
+        for file in &files {
+            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if names.iter().any(|candidate| {
+                name.eq_ignore_ascii_case(candidate)
+                    || name.eq_ignore_ascii_case(&format!("{candidate}.exe"))
+            }) {
+                matches.insert(file.clone());
+            }
+        }
+        if matches.is_empty() {
+            for file in &files {
+                if file.file_name().is_some_and(|name| name == "AppRun") {
+                    matches.insert(file.clone());
+                }
+            }
+        }
+        if matches.is_empty() {
+            for desktop in files.iter().filter(|file| {
+                file.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("desktop"))
+            }) {
+                let path = root.join(desktop);
+                if fs::metadata(&path)?.len() > 64 * 1024 {
+                    continue;
+                }
+                let content = fs::read_to_string(path).unwrap_or_default();
+                let Some(command) = content.lines().find_map(|line| line.strip_prefix("Exec="))
+                else {
+                    continue;
+                };
+                let Some(first) = command.split_whitespace().next() else {
+                    continue;
+                };
+                if first.is_empty()
+                    || !first
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-._/".contains(&b))
+                {
+                    continue;
+                }
+                let command_name = Path::new(first)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if [
+                    "sh", "bash", "dash", "zsh", "env", "python", "python3", "perl", "ruby",
+                ]
+                .contains(&command_name)
+                {
+                    continue;
+                }
+                let relative = Path::new(first.trim_start_matches("./"));
+                if safe_native_relative(relative) && root.join(relative).is_file() {
+                    matches.insert(relative.to_path_buf());
+                } else {
+                    for file in &files {
+                        if file
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.eq_ignore_ascii_case(command_name))
+                        {
+                            matches.insert(file.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match matches.len() {
+        0 => Err(fail("The release has no identifiable application entry.")),
+        1 => checked(root, matches.iter().next().unwrap(), macos),
+        _ => Err(crate::Error::Entrypoints(
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod entrypoint_tests {
+    use super::*;
+    #[test]
+    fn ambiguous_names_require_a_safe_explicit_relative_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("bin")).unwrap();
+        fs::create_dir(tmp.path().join("other")).unwrap();
+        fs::write(tmp.path().join("bin/newcraft"), b"one").unwrap();
+        fs::write(tmp.path().join("other/newcraft"), b"two").unwrap();
+        let error = resolve_entrypoint(tmp.path(), &["newcraft"], None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bin") && error.contains("other"));
+        assert_eq!(
+            resolve_entrypoint(tmp.path(), &["newcraft"], Some("bin/newcraft"), false).unwrap(),
+            tmp.path().join("bin/newcraft")
+        );
+        assert!(resolve_entrypoint(tmp.path(), &["newcraft"], Some("../outside"), false).is_err());
+    }
+    #[test]
+    fn desktop_metadata_is_parsed_as_data_and_never_as_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("bin")).unwrap();
+        fs::write(tmp.path().join("bin/editor"), b"app").unwrap();
+        fs::write(
+            tmp.path().join("app.desktop"),
+            b"[Desktop Entry]\nExec=bin/editor %U\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_entrypoint(tmp.path(), &["unknown"], None, false).unwrap(),
+            tmp.path().join("bin/editor")
+        );
+        fs::write(
+            tmp.path().join("app.desktop"),
+            b"[Desktop Entry]\nExec=sh -c malicious\n",
+        )
+        .unwrap();
+        assert!(resolve_entrypoint(tmp.path(), &["unknown"], None, false).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn selected_entry_cannot_be_a_symlink_outside_payload() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), tmp.path().join("escape")).unwrap();
+        assert!(resolve_entrypoint(tmp.path(), &["escape"], Some("escape"), false).is_err());
+    }
+    #[test]
+    fn unnamed_unique_mac_bundle_is_detected_but_multiple_are_not_guessed() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("Nice.app")).unwrap();
+        assert_eq!(
+            resolve_entrypoint(tmp.path(), &["unknown"], None, true).unwrap(),
+            tmp.path().join("Nice.app")
+        );
+        fs::create_dir(tmp.path().join("Other.app")).unwrap();
+        assert!(
+            resolve_entrypoint(tmp.path(), &["unknown"], None, true)
+                .unwrap_err()
+                .to_string()
+                .contains("Multiple")
+        );
+    }
+}

@@ -1,4 +1,5 @@
 mod assets;
+mod palette;
 mod theme;
 mod tray;
 mod views;
@@ -34,6 +35,7 @@ pub enum Page {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsTab {
     General,
+    Storage,
     Changelog,
     About,
 }
@@ -50,6 +52,10 @@ pub struct Launcher {
     page: Page,
     settings_tab: SettingsTab,
     search: String,
+    palette_open: bool,
+    palette_query: String,
+    palette_selected: usize,
+    palette_focus: bool,
     selected_apps: BTreeSet<String>,
     discipline: usize,
     detail: Option<String>,
@@ -66,8 +72,27 @@ pub struct Launcher {
     feed_path: String,
     public_key: String,
     selected_version: String,
+    entrypoint_app: Option<String>,
+    entrypoint_draft: String,
+    storage_report: Option<craftlauncher_core::storage::StorageReport>,
+    confirm_storage: Option<(String, String, u64)>,
+    selected_cache: BTreeSet<String>,
+    confirm_cache: bool,
     exit_after: Option<Instant>,
 }
+fn transfer_details(progress: &Progress) -> Option<String> {
+    let transferred = progress.transferred_bytes? as f64 / 1_000_000.0;
+    let total = progress.total_bytes? as f64 / 1_000_000.0;
+    let mut text = format!("{transferred:.1} / {total:.1} MB");
+    if let Some(speed) = progress.bytes_per_second {
+        text.push_str(&format!(" · {:.1} MB/s", speed / 1_000_000.0));
+    }
+    if let Some(seconds) = progress.seconds_remaining {
+        text.push_str(&format!(" · ~{seconds} s remaining"));
+    }
+    Some(text)
+}
+
 impl Launcher {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -98,9 +123,10 @@ impl Launcher {
             Page::MyApps
         };
         let launcher = std::env::current_exe().unwrap_or_default();
+        let workflows = workflows::Workflows::restore(&snapshot.root);
         let worker = Worker::new(manager, launcher);
         Self {
-            workflows: workflows::Workflows::default(),
+            workflows,
             worker,
             snapshot,
             assets: Assets::load(&cc.egui_ctx),
@@ -108,6 +134,10 @@ impl Launcher {
             page,
             settings_tab: SettingsTab::General,
             search: String::new(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
+            palette_focus: false,
             selected_apps: BTreeSet::new(),
             discipline: 0,
             detail: None,
@@ -124,6 +154,12 @@ impl Launcher {
             feed_path,
             public_key,
             selected_version: String::new(),
+            entrypoint_app: None,
+            entrypoint_draft: String::new(),
+            storage_report: None,
+            confirm_storage: None,
+            selected_cache: BTreeSet::new(),
+            confirm_cache: false,
             exit_after: exit_after.map(|duration| Instant::now() + duration),
         }
     }
@@ -131,6 +167,7 @@ impl Launcher {
         if matches!(
             command,
             Command::Install { .. }
+                | Command::Repair(_)
                 | Command::UpdateReviewed { .. }
                 | Command::DownloadSelected { .. }
                 | Command::OpenProject { .. }
@@ -159,17 +196,47 @@ impl Launcher {
             match event {
                 Event::State(snapshot) => self.snapshot = *snapshot,
                 Event::LocalApps(apps) => self.workflows.local = apps,
+                Event::Entrypoints { app_id, paths } => {
+                    self.workflows.entrypoint_choices = Some((app_id, paths));
+                    self.page = Page::Queue;
+                }
+                Event::Storage(report) => {
+                    self.selected_cache = report
+                        .downloads
+                        .iter()
+                        .filter(|entry| !entry.protected)
+                        .map(|entry| entry.name.clone())
+                        .collect();
+                    self.storage_report = Some(report);
+                }
                 Event::Progress(progress) => self.progress = Some(progress),
                 Event::TaskFinished { id, result } => {
+                    let mut cancelled_task = None;
                     if self.workflows.active == Some(id) {
                         self.workflows.active = None;
+                        let intent = self.workflows.stop_intent.take();
                         self.workflows.tasks[id].status = match &result {
                             Ok(_) => workflows::TaskStatus::Done,
                             Err(error) if error.to_ascii_lowercase().contains("cancelled") => {
-                                workflows::TaskStatus::Cancelled
+                                match intent {
+                                    Some(workflows::StopIntent::Pause) => {
+                                        workflows::TaskStatus::Paused
+                                    }
+                                    _ => {
+                                        cancelled_task =
+                                            Some(self.workflows.tasks[id].journal_id.clone());
+                                        workflows::TaskStatus::Cancelled
+                                    }
+                                }
                             }
                             Err(error) => workflows::TaskStatus::Failed(error.clone()),
                         };
+                    }
+                    self.persist_queue();
+                    if self.workflows.journal_error.is_none()
+                        && let Some(task_id) = cancelled_task
+                    {
+                        self.discard_task_cache(&task_id);
                     }
                     self.progress = None;
                     self.toast = Some(match result {
@@ -273,6 +340,7 @@ impl eframe::App for Launcher {
     }
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        self.palette_shortcut(&ctx);
         self.sidebar(root);
         egui::Panel::bottom("status")
             .frame(
@@ -291,8 +359,11 @@ impl eframe::App for Launcher {
                                     .map(|p| {
                                         format!(
                                             "{} · {} {:.0}%",
-                                            craftlauncher_core::app(&p.app_id)
-                                                .map(|a| a.name)
+                                            self.snapshot
+                                                .products
+                                                .iter()
+                                                .find(|a| a.id == p.app_id)
+                                                .map(|a| a.name.as_str())
                                                 .unwrap_or("Launcher"),
                                             p.phase,
                                             p.percent
@@ -303,8 +374,11 @@ impl eframe::App for Launcher {
                             .size(11.0)
                             .color(self.palette.muted),
                         );
+                        if let Some(detail) = self.progress.as_ref().and_then(transfer_details) {
+                            ui.label(RichText::new(detail).size(10.0).color(self.palette.muted));
+                        }
                         if ui.small_button("Cancel").clicked() {
-                            self.worker.cancel();
+                            self.stop_active(workflows::StopIntent::Cancel);
                         }
                     } else {
                         ui.label(RichText::new("●").color(self.palette.accent).size(9.0));
@@ -401,6 +475,7 @@ impl eframe::App for Launcher {
         self.details(&ctx);
         self.remove_dialog(&ctx);
         self.workflow_dialogs(&ctx);
+        self.command_palette(&ctx);
         if self.first_frame {
             self.first_frame = false;
             ctx.request_repaint();

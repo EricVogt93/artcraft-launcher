@@ -4,13 +4,18 @@ This changelog describes the launcher only. Changes to third-party apps are publ
 
 ## Unreleased
 
+- Discover and manage new public Storytold Craft repositories from a cached dynamic catalog, with safe package and application-entry selection.
+- Restore unfinished queue tasks paused after restart, resume partial downloads where supported and show transfer estimates.
+- Check and repair managed installations, inspect storage and remove selected unreferenced cache files or rollback versions.
+- Add a quick-action palette and bounded local diagnostics for observable early launch failures.
+
 - Add an update review with selectable apps, version comparisons, download totals and version-pin protection.
 - Queue installations and package downloads with per-item progress, cancellation, failure isolation and retries.
 - Open dropped project files in a selected Craft app and keep a clearable local recent-project history.
 - Discover local Craft installations and new public products on the official GitHub account.
 - Bundle official icons and screenshots for additional products and show release/platform availability in product details.
 
-- Group tools into eight categories with shared catalog metadata, category filters and searchable category names.
+- Group tools into categories with shared catalog metadata, category filters and searchable category names.
 
 - Add AniCraft, CADCraft, DeckCraft, FigCraft, GridCraft, SoundCraft and WordCraft to the app catalog and discipline filters.
 - Follow the PrintCraft rename to PdfCraft for release downloads and executable detection while retaining existing local settings and installations.

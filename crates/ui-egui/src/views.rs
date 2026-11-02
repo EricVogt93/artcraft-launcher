@@ -3,11 +3,56 @@ use crate::{
     widgets::{self, ButtonKind, CONTROL_HEIGHT},
 };
 use craftlauncher_core::{
-    App, AppPreferences, CATALOG, Channel, Command, Theme, catalog::DISCIPLINES, model::is_newer,
-    releases::asset_for, self_update,
+    AppPreferences, Channel, Command, Theme,
+    catalog::{DISCIPLINES, Product},
+    model::is_newer,
+    releases::{
+        AssetResolution, ChecksumSource, asset_preference_key, checksum_source, resolve_asset,
+    },
+    self_update,
 };
 use egui::{Align, Color32, Context, Frame, Layout, RichText, Stroke, Ui, Vec2};
 use std::time::Instant;
+
+#[derive(Clone, Copy)]
+struct App<'a> {
+    id: &'a str,
+    name: &'a str,
+    category: &'a str,
+    discipline: &'a str,
+    description: &'a str,
+    detail: &'a str,
+    color: [u8; 3],
+    tags: &'a [String],
+    stage: &'a str,
+    repository: &'a str,
+    executable_name: &'a str,
+}
+impl<'a> From<&'a Product> for App<'a> {
+    fn from(p: &'a Product) -> Self {
+        Self {
+            id: &p.id,
+            name: &p.name,
+            category: &p.category,
+            discipline: &p.discipline,
+            description: &p.description,
+            detail: &p.detail,
+            color: p.color,
+            tags: &p.tags,
+            stage: &p.stage,
+            repository: &p.repository,
+            executable_name: &p.executable_name,
+        }
+    }
+}
+impl<'a> App<'a> {
+    fn repository(self) -> &'a str {
+        self.repository
+    }
+    fn executable_name(self) -> &'a str {
+        self.executable_name
+    }
+}
 
 impl Launcher {
     pub(crate) fn sidebar(&mut self, root: &mut Ui) {
@@ -171,7 +216,12 @@ impl Launcher {
             ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(size)));
         } else {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-            let app = craftlauncher_core::app(id).ok();
+            let app = self
+                .snapshot
+                .products
+                .iter()
+                .find(|app| app.id == id)
+                .map(App::from);
             let color = app
                 .map(|app| Color32::from_rgb(app.color[0], app.color[1], app.color[2]))
                 .unwrap_or(self.palette.accent);
@@ -247,7 +297,7 @@ impl Launcher {
             let search_width = (ui.available_width() - filter_width - 12.0).max(180.0);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search your creative tools…   Ctrl / ⌘ K")
+                    .hint_text("Search your creative tools…")
                     .desired_width(search_width - 28.0)
                     .font(egui::FontId::proportional(13.0))
                     .min_size(Vec2::new(search_width, CONTROL_HEIGHT))
@@ -260,9 +310,6 @@ impl Launcher {
                     Stroke::new(1.5, self.palette.accent),
                     egui::StrokeKind::Inside,
                 );
-            }
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
-                response.request_focus();
             }
             egui::ComboBox::from_id_salt("discipline")
                 .selected_text(
@@ -282,8 +329,10 @@ impl Launcher {
         });
         ui.add_space(14.0);
         let search = self.search.to_lowercase();
-        let mut apps: Vec<App> = CATALOG
-            .into_iter()
+        let products = self.snapshot.products.clone();
+        let mut apps: Vec<App> = products
+            .iter()
+            .map(App::from)
             .filter(|app| {
                 let installed = self.snapshot.state.installations.contains_key(app.id);
                 let discipline = self.discipline == 0
@@ -575,7 +624,7 @@ impl Launcher {
         });
         ui.add_space(14.0);
     }
-    fn preferences(&self, id: &str) -> AppPreferences {
+    pub(crate) fn preferences(&self, id: &str) -> AppPreferences {
         self.snapshot
             .state
             .preferences
@@ -583,7 +632,7 @@ impl Launcher {
             .cloned()
             .unwrap_or_default()
     }
-    fn release(&self, id: &str) -> Option<&craftlauncher_core::Release> {
+    pub(crate) fn release(&self, id: &str) -> Option<&craftlauncher_core::Release> {
         let pref = self.preferences(id);
         let channel = pref.channel.unwrap_or(self.snapshot.state.settings.channel);
         let cache = self
@@ -602,10 +651,40 @@ impl Launcher {
             cache.release.as_ref()
         }
     }
+    fn selected_asset<'a>(
+        &self,
+        id: &str,
+        release: &'a craftlauncher_core::Release,
+    ) -> Option<&'a craftlauncher_core::Asset> {
+        let preferences = self.preferences(id);
+        let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+        resolve_asset(
+            release,
+            &self.snapshot.platform,
+            &self.snapshot.arch,
+            preferences.selected_assets.get(&key).map(String::as_str),
+        )
+        .selected()
+    }
     fn available(&self, id: &str) -> bool {
-        self.release(id)
-            .and_then(|release| asset_for(release, &self.snapshot.platform, &self.snapshot.arch))
-            .is_some()
+        !self
+            .snapshot
+            .products
+            .iter()
+            .any(|product| product.id == id && product.unavailable)
+            && self
+                .release(id)
+                .and_then(|release| {
+                    self.selected_asset(id, release)
+                        .map(|asset| (release, asset))
+                })
+                .is_some_and(|(release, asset)| {
+                    craftlauncher_core::platform::supports_managed(
+                        id,
+                        &self.snapshot.platform,
+                        asset,
+                    ) && !matches!(checksum_source(release, asset), ChecksumSource::Missing)
+                })
     }
     fn update_count(&self) -> usize {
         self.snapshot.state.pending.len()
@@ -686,7 +765,7 @@ impl Launcher {
                 ui.set_min_height(34.0);
                 ui.spacing_mut().item_spacing.y = 3.0;
                 ui.label(RichText::new(app.description).size(12.0).color(self.palette.muted));
-                if compatible && self.release(app.id).and_then(|release| asset_for(release, &self.snapshot.platform, &self.snapshot.arch)).is_some_and(|asset| asset.name.ends_with(".AppImage")) {
+                if compatible && self.release(app.id).and_then(|release| self.selected_asset(app.id, release)).is_some_and(|asset| asset.name.ends_with(".AppImage")) {
                     ui.label(RichText::new("AppImage · extracted native installation").size(11.0).color(self.palette.muted));
                 }
                 if web_only && self.release(app.id).is_some() {
@@ -766,6 +845,30 @@ impl Launcher {
         }
         if self.snapshot.state.installations.contains_key(app.id) {
             if ui
+                .add_enabled(!self.worker.busy(), egui::Button::new("Check installation"))
+                .clicked()
+            {
+                self.command(Command::CheckInstallation(app.id.into()));
+                ui.close();
+            }
+            let managed = self
+                .snapshot
+                .state
+                .installations
+                .get(app.id)
+                .is_some_and(|install| install.managed);
+            if ui
+                .add_enabled(
+                    !self.worker.busy() && managed,
+                    egui::Button::new("Repair installation"),
+                )
+                .on_hover_text("Reinstall the same verified release and preserve your preferences.")
+                .clicked()
+            {
+                self.command(Command::Repair(app.id.into()));
+                ui.close();
+            }
+            if ui
                 .add_enabled(!self.worker.busy(), egui::Button::new("Show app folder"))
                 .clicked()
             {
@@ -821,10 +924,21 @@ impl Launcher {
         let Some(id) = self.detail.clone() else {
             return;
         };
-        let Ok(app) = craftlauncher_core::app(&id) else {
+        let Some(product) = self.snapshot.products.iter().find(|p| p.id == id).cloned() else {
             self.detail = None;
             return;
         };
+        let app = App::from(&product);
+        if self.entrypoint_app.as_deref() != Some(id.as_str()) {
+            let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+            self.entrypoint_draft = self
+                .preferences(&id)
+                .selected_entrypoints
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            self.entrypoint_app = Some(id.clone());
+        }
         let mut open = true;
         egui::Window::new(app.name).id(egui::Id::new("details")).open(&mut open).collapsible(false).resizable(false).default_width(660.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-130.0).max(300.0)).show(ui, |ui| {
@@ -833,6 +947,7 @@ impl Launcher {
                 ui.add_space(10.0); ui.label(app.detail);
                 ui.label(RichText::new(format!("{} · Experimental software", app.stage)).color(self.palette.muted));
                 let release_status = match self.release(app.id) {
+                    _ if product.unavailable => "Repository unavailable · installed app remains usable".into(),
                     Some(release) if self.available(app.id) => format!("{} available for {} / {}", release.tag_name, self.snapshot.platform, self.snapshot.arch),
                     Some(release) => format!("{} published · no package for {} / {}", release.tag_name, self.snapshot.platform, self.snapshot.arch),
                     None => "No published release loaded. Refresh releases to check availability.".into(),
@@ -841,6 +956,39 @@ impl Launcher {
                 self.project_controls(ui, Some(app.id));
                 ui.horizontal_wrapped(|ui| { for tag in app.tags { ui.label(RichText::new(format!(" {tag} ")).size(10.0).background_color(self.palette.sunken).color(self.palette.muted)); } });
                 ui.add_space(12.0); ui.separator();
+                if let Some(release) = self.release(app.id).cloned() {
+                    let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+                    let mut prefs = self.preferences(app.id);
+                    let selected = prefs.selected_assets.get(&key).cloned();
+                    let candidates = match resolve_asset(&release, &self.snapshot.platform, &self.snapshot.arch, None) {
+                        AssetResolution::Ambiguous(candidates) => candidates,
+                        _ => Vec::new(),
+                    };
+                    if !candidates.is_empty() {
+                        ui.label("Several compatible packages were found. Choose one:");
+                        let mut choice = selected.unwrap_or_default();
+                        egui::ComboBox::from_id_salt("package_choice")
+                            .selected_text(if choice.is_empty() { "Choose a package" } else { &choice })
+                            .show_ui(ui, |ui| { for candidate in &candidates { ui.selectable_value(&mut choice, candidate.name.clone(), &candidate.name); } });
+                        if !choice.is_empty() && prefs.selected_assets.get(&key) != Some(&choice) {
+                            prefs.selected_assets.insert(key, choice);
+                            self.command(Command::Preferences(app.id.into(), prefs));
+                        }
+                    }
+                }
+                ui.collapsing("Application entry in archive", |ui| {
+                    ui.label("Normally detected automatically. If installation lists multiple entries, enter the path shown in the error, relative to the extracted package.");
+                    ui.text_edit_singleline(&mut self.entrypoint_draft);
+                    let trimmed = self.entrypoint_draft.trim();
+                    let valid = trimmed.is_empty() || craftlauncher_core::installer::safe_native_relative(std::path::Path::new(trimmed));
+                    if !valid { ui.colored_label(self.palette.danger, "Enter a relative path inside the package."); }
+                    if ui.add_enabled(valid && !self.worker.busy(), egui::Button::new("Save application entry")).clicked() {
+                        let mut prefs = self.preferences(app.id);
+                        let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+                        if trimmed.is_empty() { prefs.selected_entrypoints.remove(&key); } else { prefs.selected_entrypoints.insert(key, trimmed.to_owned()); }
+                        self.command(Command::Preferences(app.id.into(), prefs));
+                    }
+                });
                 let mut preferences = self.preferences(app.id); let before = preferences.clone();
                 let mut changed = false;
                 ui.add_enabled_ui(!self.worker.busy(), |ui| {
@@ -860,16 +1008,28 @@ impl Launcher {
                 let versions = self.snapshot.state.releases.get(app.id).map(|r| r.versions.clone()).unwrap_or_default();
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("install_version").selected_text(if self.selected_version.is_empty() { "Choose a release" } else { &self.selected_version }).show_ui(ui, |ui| { for release in &versions { ui.selectable_value(&mut self.selected_version, release.tag_name.clone(), &release.tag_name); } });
-                    let can_install = !self.selected_version.is_empty() && versions.iter().find(|r| r.tag_name == self.selected_version).and_then(|r| asset_for(r, &self.snapshot.platform, &self.snapshot.arch)).is_some() && !self.snapshot.state.installations.get(app.id).is_some_and(|i| !i.managed) && !self.snapshot.state.pending.contains_key(app.id);
+                    let can_install = !product.unavailable && !self.selected_version.is_empty() && versions.iter().find(|r| r.tag_name == self.selected_version).is_some_and(|r| self.selected_asset(app.id, r).is_some_and(|asset| craftlauncher_core::platform::supports_managed(app.id, &self.snapshot.platform, asset) && !matches!(checksum_source(r, asset), ChecksumSource::Missing))) && !self.snapshot.state.installations.get(app.id).is_some_and(|i| !i.managed) && !self.snapshot.state.pending.contains_key(app.id);
                     if self.primary(ui, "Install version", can_install) { self.command(Command::Install { id: app.id.into(), version: Some(self.selected_version.clone()) }); }
                     if self.snapshot.state.installations.contains_key(app.id) && ui.add_enabled(!self.worker.busy(), egui::Button::new("Open app ↗")).clicked() { self.command(Command::Launch(app.id.into())); }
                 });
-                if !self.available(app.id) { ui.label(RichText::new(format!("No compatible published package for {} / {} is currently loaded.", self.snapshot.platform, self.snapshot.arch)).color(self.palette.muted)); }
+                if !self.available(app.id) {
+                    let prefs = self.preferences(app.id);
+                    let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+                    let reason = match self.release(app.id).map(|r| resolve_asset(r, &self.snapshot.platform, &self.snapshot.arch, prefs.selected_assets.get(&key).map(String::as_str))) {
+                        Some(AssetResolution::Ready(asset)) if !craftlauncher_core::platform::supports_managed(app.id, &self.snapshot.platform, asset) => "This installer format cannot be managed for this app; use its official release page.".to_owned(),
+                        Some(AssetResolution::Ready(asset)) if matches!(checksum_source(self.release(app.id).unwrap(), asset), ChecksumSource::Missing) => "This package has no SHA-256 checksum; installation is unavailable.".to_owned(),
+                        Some(AssetResolution::Ambiguous(_)) => "Choose a compatible package above.".to_owned(),
+                        Some(AssetResolution::NoCompatible) => format!("No supported package for {} / {}.", self.snapshot.platform, self.snapshot.arch),
+                        _ if product.unavailable => "The repository is unavailable.".to_owned(),
+                        _ => "No published release loaded. Refresh releases to check.".to_owned(),
+                    };
+                    ui.label(RichText::new(reason).color(self.palette.muted));
+                }
                 if let Some(error) = self.snapshot.state.releases.get(app.id).and_then(|r| r.error.as_ref()) { ui.label(RichText::new(error).color(self.palette.danger)); }
                 ui.collapsing("Release notes", |ui| { let notes = self.release(app.id).and_then(|r| r.body.clone()).unwrap_or_else(|| "No release notes loaded.".into()); ui.label(notes); });
                 ui.horizontal(|ui| {
                     if ui.link("Source ↗").clicked() { self.external(format!("https://github.com/storytold/{}", app.repository())); }
-                    if ui.link("Product website ↗").clicked() { self.external(if app.id == "artcraft" { "https://getartcraft.com".into() } else { format!("https://getartcraft.com/apps/{}", app.executable_name()) }); }
+                    if !product.discovered && ui.link("Product website ↗").clicked() { self.external(if app.id == "artcraft" { "https://getartcraft.com".into() } else { format!("https://getartcraft.com/apps/{}", app.executable_name()) }); }
                     if app.id == "artcraft" && ui.link("Open web studio ↗").clicked() { self.external("https://app.getartcraft.com".into()); }
                     if let Some(asset) = self.release(app.id).and_then(|r| r.assets.iter().find(|a| a.name.contains("-web-") && a.name.ends_with(".zip"))).cloned()
                         && ui.link("Download WebAssembly build ↗").clicked() { self.external(asset.browser_download_url); }
@@ -884,10 +1044,11 @@ impl Launcher {
         let Some(id) = self.confirm_remove.clone() else {
             return;
         };
-        let Ok(app) = craftlauncher_core::app(&id) else {
+        let Some(product) = self.snapshot.products.iter().find(|p| p.id == id).cloned() else {
             self.confirm_remove = None;
             return;
         };
+        let app = App::from(&product);
         let managed = self
             .snapshot
             .state
@@ -1006,8 +1167,10 @@ impl Launcher {
                 .color(self.palette.muted),
         );
         ui.add_space(12.0);
-        let apps: Vec<App> = CATALOG
-            .into_iter()
+        let products = self.snapshot.products.clone();
+        let apps: Vec<App> = products
+            .iter()
+            .map(App::from)
             .filter(|app| {
                 self.snapshot.state.pending.contains_key(app.id)
                     || self
@@ -1175,6 +1338,7 @@ impl Launcher {
         ui.horizontal(|ui| {
             for (tab, label, width) in [
                 (SettingsTab::General, "General", 110.0),
+                (SettingsTab::Storage, "Storage", 110.0),
                 (SettingsTab::Changelog, "Changelog", 130.0),
                 (SettingsTab::About, "About & independence", 196.0),
             ] {
@@ -1198,6 +1362,10 @@ impl Launcher {
             }
             SettingsTab::About => {
                 self.settings_about(ui);
+                return;
+            }
+            SettingsTab::Storage => {
+                self.settings_storage(ui);
                 return;
             }
             SettingsTab::General => {}
@@ -1296,6 +1464,172 @@ impl Launcher {
         });
     }
 
+    fn settings_storage(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Managed storage").size(20.0).strong());
+        ui.label("Sizes exclude linked external apps and do not follow symbolic links.");
+        if ui
+            .add_enabled(!self.worker.busy(), egui::Button::new("Scan storage"))
+            .clicked()
+        {
+            self.command(Command::ScanStorage);
+        }
+        if let Some(report) = self.storage_report.clone() {
+            for app in report.apps {
+                let name = self
+                    .snapshot
+                    .products
+                    .iter()
+                    .find(|p| p.id == app.id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or(&app.id);
+                ui.group(|ui| {
+                    ui.label(RichText::new(name).strong());
+                    ui.label(format!(
+                        "Active {:.1} MB · rollback {:.1} MB · prepared update {:.1} MB",
+                        app.active_bytes as f64 / 1_000_000.0,
+                        app.rollback_bytes as f64 / 1_000_000.0,
+                        app.pending_bytes as f64 / 1_000_000.0
+                    ));
+                    if let Some(version) = app.rollback_version
+                        && ui
+                            .add_enabled(
+                                !self.worker.busy(),
+                                egui::Button::new(format!("Remove rollback {version}…")),
+                            )
+                            .clicked()
+                    {
+                        self.confirm_storage = Some((app.id.clone(), version, app.rollback_bytes));
+                    }
+                });
+            }
+            let bytes: u64 = report.downloads.iter().map(|file| file.bytes).sum();
+            ui.add_space(12.0);
+            ui.label(format!(
+                "Partial download cache: {} files · {:.1} MB",
+                report.downloads.len(),
+                bytes as f64 / 1_000_000.0
+            ));
+            ui.label("Downloads referenced by the queue are protected.");
+            for file in &report.downloads {
+                let mut selected = self.selected_cache.contains(&file.name);
+                let label = format!(
+                    "{} · {:.1} MB{}",
+                    file.name,
+                    file.bytes as f64 / 1_000_000.0,
+                    if file.protected { " · in queue" } else { "" }
+                );
+                if ui
+                    .add_enabled(
+                        !file.protected && !self.worker.busy(),
+                        egui::Checkbox::new(&mut selected, label),
+                    )
+                    .changed()
+                {
+                    if selected {
+                        self.selected_cache.insert(file.name.clone());
+                    } else {
+                        self.selected_cache.remove(&file.name);
+                    }
+                }
+            }
+            let count = self.selected_cache.len();
+            let selected_bytes: u64 = report
+                .downloads
+                .iter()
+                .filter(|file| self.selected_cache.contains(&file.name) && !file.protected)
+                .map(|file| file.bytes)
+                .sum();
+            if ui
+                .add_enabled(
+                    count > 0 && !self.worker.busy(),
+                    egui::Button::new(format!(
+                        "Remove {count} selected · {:.1} MB…",
+                        selected_bytes as f64 / 1_000_000.0
+                    )),
+                )
+                .clicked()
+            {
+                self.confirm_cache = true;
+            }
+            if self.confirm_cache {
+                let selected = report
+                    .downloads
+                    .iter()
+                    .filter(|file| self.selected_cache.contains(&file.name) && !file.protected)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                egui::Window::new("Remove cached downloads?")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ui.ctx(), |ui| {
+                        ui.label(format!(
+                            "Remove {} cached files ({:.1} MB)?",
+                            selected.len(),
+                            selected_bytes as f64 / 1_000_000.0
+                        ));
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for file in &selected {
+                                    ui.label(format!(
+                                        "{} · {:.1} MB",
+                                        file.name,
+                                        file.bytes as f64 / 1_000_000.0
+                                    ));
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                self.confirm_cache = false;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !selected.is_empty() && !self.worker.busy(),
+                                    egui::Button::new("Remove selected files"),
+                                )
+                                .clicked()
+                            {
+                                self.command(Command::RemoveCachedDownloads(
+                                    selected.iter().map(|file| file.name.clone()).collect(),
+                                ));
+                                self.confirm_cache = false;
+                            }
+                        });
+                    });
+            }
+        } else {
+            ui.label("Scan to see usage by app and the download cache.");
+        }
+        if let Some((id, version, bytes)) = self.confirm_storage.clone() {
+            egui::Window::new("Remove previous version?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Remove {id} {version} and free approximately {:.1} MB?",
+                        bytes as f64 / 1_000_000.0
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_storage = None;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.worker.busy(),
+                                egui::Button::new("Remove previous version"),
+                            )
+                            .clicked()
+                        {
+                            self.command(Command::RemoveRollback {
+                                id: id.clone(),
+                                version: version.clone(),
+                            });
+                            self.confirm_storage = None;
+                        }
+                    });
+                });
+        }
+    }
     fn settings_changelog(&self, ui: &mut Ui) {
         ui.label(
             RichText::new("WHAT'S NEW IN CRAFTLAUNCHER")
