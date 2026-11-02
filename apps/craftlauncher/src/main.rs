@@ -16,6 +16,10 @@ use std::{
 #[derive(Parser)]
 #[command(name = "craftlauncher", about = "Your native ArtCraft creative toolbox", version = self_update::build_version())]
 struct Args {
+    #[arg(long, hide = true, requires = "internal_log")]
+    internal_monitor: Option<PathBuf>,
+    #[arg(long, hide = true, requires = "internal_monitor")]
+    internal_log: Option<PathBuf>,
     /// Library location; defaults to the native per-user data directory.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -44,6 +48,12 @@ struct Args {
     /// Version tag to install instead of the latest eligible release.
     #[arg(long, requires = "install")]
     version_choice: Option<String>,
+    /// Select a compatible release asset when several packages match this machine.
+    #[arg(long, requires = "install")]
+    package: Option<String>,
+    /// Choose an application path relative to the extracted package.
+    #[arg(long, requires = "install")]
+    entrypoint: Option<String>,
     /// Save packages for this machine without installing (comma-separated app IDs).
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     download: Vec<String>,
@@ -101,6 +111,30 @@ fn main() {
     }
 }
 fn run(args: Args) -> Result<()> {
+    if let Some(executable) = &args.internal_monitor {
+        use std::io::Write;
+        let log = args
+            .internal_log
+            .as_ref()
+            .ok_or_else(|| fail("Missing monitor log path."))?;
+        return craftlauncher_core::diagnostics::capture(executable, log, |event| {
+            let mut out = std::io::stdout().lock();
+            match event {
+                craftlauncher_core::diagnostics::MonitorEvent::Started(pid) => {
+                    let _ = writeln!(out, "START {pid}");
+                }
+                craftlauncher_core::diagnostics::MonitorEvent::Exited(code, success) => {
+                    let _ = writeln!(
+                        out,
+                        "EXIT {} {}",
+                        i32::from(success),
+                        code.map_or_else(|| "signal".into(), |c| c.to_string())
+                    );
+                }
+            }
+            let _ = out.flush();
+        });
+    }
     if let Some(folder) = args.generate_update_key {
         return generate_key(&folder);
     }
@@ -216,7 +250,11 @@ fn run(args: Args) -> Result<()> {
         manager.configure(settings, &executable)?;
     }
     if args.check_releases || args.update_apps {
+        manager.discover_products(&cancel)?;
         manager.refresh_all(&cancel, &mut |_| {})?;
+        if let Some(error) = &manager.state.discovery_error {
+            return Err(fail(format!("Product discovery unavailable: {error}")));
+        }
     }
     if !args.download.is_empty() {
         for id in &args.download {
@@ -233,6 +271,58 @@ fn run(args: Args) -> Result<()> {
     }
     if let Some(id) = args.install {
         manager.refresh_app(&id)?;
+        if let Some(package) = args.package {
+            let snapshot = manager.snapshot();
+            let cache = snapshot
+                .state
+                .releases
+                .get(&id)
+                .ok_or_else(|| fail("No release is available."))?;
+            let release = if let Some(version) = args.version_choice.as_deref() {
+                cache.versions.iter().find(|r| r.tag_name == version)
+            } else {
+                cache.release.as_ref()
+            }
+            .ok_or_else(|| fail("The selected release is not available."))?;
+            let resolution = craftlauncher_core::releases::resolve_asset(
+                release,
+                &snapshot.platform,
+                &snapshot.arch,
+                Some(&package),
+            );
+            if !matches!(resolution, craftlauncher_core::releases::AssetResolution::Ready(asset) if asset.name == package)
+            {
+                return Err(fail(
+                    "The selected package is not a compatible candidate for this release.",
+                ));
+            }
+            let mut preferences = manager.preferences(&id);
+            preferences.selected_assets.insert(
+                craftlauncher_core::releases::asset_preference_key(
+                    &snapshot.platform,
+                    &snapshot.arch,
+                ),
+                package,
+            );
+            manager.set_preferences(&id, preferences)?;
+        }
+        if let Some(entrypoint) = args.entrypoint {
+            if !craftlauncher_core::installer::safe_native_relative(Path::new(&entrypoint)) {
+                return Err(fail(
+                    "Entrypoint must be a relative path inside the package.",
+                ));
+            }
+            let snapshot = manager.snapshot();
+            let mut preferences = manager.preferences(&id);
+            preferences.selected_entrypoints.insert(
+                craftlauncher_core::releases::asset_preference_key(
+                    &snapshot.platform,
+                    &snapshot.arch,
+                ),
+                entrypoint,
+            );
+            manager.set_preferences(&id, preferences)?;
+        }
         manager.stage_install(&id, args.version_choice.as_deref(), &cancel, &mut |p| {
             eprintln!("{}: {} {:.0}%", p.app_id, p.phase, p.percent)
         })?;

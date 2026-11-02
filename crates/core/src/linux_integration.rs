@@ -22,6 +22,15 @@ fn wrapper(id: &str, executable: &Path) -> Result<String> {
         path.replace('\'', "'\\''")
     ))
 }
+fn validate_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 100
+        || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    {
+        return Err(fail("Invalid product identifier."));
+    }
+    Ok(())
+}
 fn paths(bin_directory: &Path, data: &Path, id: &str) -> (PathBuf, PathBuf) {
     (
         bin_directory.join(id),
@@ -67,7 +76,21 @@ pub fn register(home: &Path, data: &Path, id: &str, executable: &Path) -> Result
     register_in(&home.join(".local/bin"), data, id, executable)
 }
 pub fn register_in(bin_directory: &Path, data: &Path, id: &str, executable: &Path) -> Result<()> {
-    let info = app(id)?;
+    register_product_in(
+        bin_directory,
+        data,
+        &crate::catalog::Product::from(app(id)?),
+        executable,
+    )
+}
+pub fn register_product_in(
+    bin_directory: &Path,
+    data: &Path,
+    info: &crate::catalog::Product,
+    executable: &Path,
+) -> Result<()> {
+    let id = info.id.as_str();
+    validate_id(id)?;
     let script = wrapper(id, executable)?;
     let (bin, desktop) = paths(bin_directory, data, id);
     let desktop_marker = format!("X-CraftLauncher-App={id}\n");
@@ -80,7 +103,7 @@ pub fn register_in(bin_directory: &Path, data: &Path, id: &str, executable: &Pat
         "[Desktop Entry]\nVersion=1.0\nType=Application\nName={}\nGenericName={}\nComment={}\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=Graphics;\nKeywords={};\nStartupNotify=true\n{}X-CraftLauncher-Executable={}\n",
         info.name,
         info.category,
-        info.description,
+        info.description.replace(['\n', '\r'], " "),
         desktop_quote(&bin),
         bin.display(),
         icon,
@@ -107,11 +130,64 @@ pub fn register_in(bin_directory: &Path, data: &Path, id: &str, executable: &Pat
     Ok(())
 }
 
+/// Verify ownership and executable routing without overwriting any files.
+pub fn check_product_in(
+    bin_directory: &Path,
+    data: &Path,
+    product: &crate::catalog::Product,
+    executable: &Path,
+) -> Result<bool> {
+    let id = product.id.as_str();
+    validate_id(id)?;
+    let (bin, desktop) = paths(bin_directory, data, id);
+    if !owned_regular(&bin, &marker(id))
+        || !owned_regular(&desktop, &format!("X-CraftLauncher-App={id}\n"))
+    {
+        return Ok(false);
+    }
+    if fs::read_to_string(&bin)? != wrapper(id, executable)? {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(&bin)?.permissions().mode() & 0o111 == 0 {
+            return Ok(false);
+        }
+    }
+    let text = fs::read_to_string(desktop)?;
+    let expected_exec = format!("Exec={}", desktop_quote(&bin));
+    let expected_target = format!("X-CraftLauncher-Executable={}", executable.display());
+    let exec_lines: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("Exec="))
+        .collect();
+    let target_lines: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("X-CraftLauncher-Executable="))
+        .collect();
+    Ok(exec_lines == [expected_exec.as_str()] && target_lines == [expected_target.as_str()])
+}
+
 pub fn remove(home: &Path, data: &Path, id: &str, executable: &Path) -> Result<()> {
     remove_in(&home.join(".local/bin"), data, id, executable)
 }
 pub fn remove_in(bin_directory: &Path, data: &Path, id: &str, executable: &Path) -> Result<()> {
-    app(id)?;
+    remove_product_in(
+        bin_directory,
+        data,
+        &crate::catalog::Product::from(app(id)?),
+        executable,
+    )
+}
+pub fn remove_product_in(
+    bin_directory: &Path,
+    data: &Path,
+    product: &crate::catalog::Product,
+    executable: &Path,
+) -> Result<()> {
+    let id = product.id.as_str();
+    validate_id(id)?;
     let (bin, desktop) = paths(bin_directory, data, id);
     if owned_regular(&bin, &marker(id)) && fs::read_to_string(&bin)? == wrapper(id, executable)? {
         fs::remove_file(bin)?;

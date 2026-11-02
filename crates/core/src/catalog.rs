@@ -11,7 +11,7 @@ pub struct App {
     pub stage: &'static str,
 }
 
-pub const DISCIPLINES: [&str; 8] = [
+pub const DISCIPLINES: [&str; 9] = [
     "AI & 3D",
     "Photography & illustration",
     "Video & animation",
@@ -20,6 +20,7 @@ pub const DISCIPLINES: [&str; 8] = [
     "Audio production",
     "Office & productivity",
     "PDF & publishing",
+    "Other Craft apps",
 ];
 
 pub const CATALOG: [App; 15] = [
@@ -213,5 +214,131 @@ impl App {
             "printcraft" => "pdfcraft",
             id => id,
         }
+    }
+}
+
+/// Owned product metadata shared by the manager and its UI snapshots. Built-in
+/// descriptions are presentation overrides; discovered products need no code.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Product {
+    pub id: String,
+    pub repository: String,
+    pub name: String,
+    pub category: String,
+    pub discipline: String,
+    pub description: String,
+    pub detail: String,
+    pub color: [u8; 3],
+    pub tags: Vec<String>,
+    pub stage: String,
+    pub executable_name: String,
+    pub github_id: Option<u64>,
+    pub unavailable: bool,
+    pub discovered: bool,
+}
+
+impl From<App> for Product {
+    fn from(app: App) -> Self {
+        Self {
+            id: app.id.into(),
+            repository: app.repository().into(),
+            name: app.name.into(),
+            category: app.category.into(),
+            discipline: app.discipline.into(),
+            description: app.description.into(),
+            detail: app.detail.into(),
+            color: app.color,
+            tags: app.tags.into_iter().map(str::to_owned).collect(),
+            stage: app.stage.into(),
+            executable_name: app.executable_name().into(),
+            github_id: None,
+            unavailable: false,
+            discovered: false,
+        }
+    }
+}
+
+/// Construct an owned catalog from built-ins and the last successful scan.
+/// Reject unsafe identifiers and collisions before these values can become paths.
+pub fn products(discovered: &[crate::workspace::DiscoveredApp]) -> Vec<Product> {
+    let mut products: Vec<Product> = CATALOG.into_iter().map(Product::from).collect();
+    for app in discovered {
+        let id = if app.app_id.is_empty() {
+            app.repository.to_ascii_lowercase()
+        } else {
+            app.app_id.clone()
+        };
+        let valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 100
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        };
+        if !valid(&id)
+            || !valid(&app.repository)
+            || products.iter().any(|other| {
+                other.id.eq_ignore_ascii_case(&id)
+                    || other.repository.eq_ignore_ascii_case(&app.repository)
+            })
+        {
+            continue;
+        }
+        products.push(Product {
+            id: id.clone(),
+            repository: app.repository.clone(),
+            name: app.repository.clone(),
+            category: "Craft app".into(),
+            discipline: "Other Craft apps".into(),
+            description: app.description.clone(),
+            detail: app.description.clone(),
+            color: [45, 129, 255],
+            tags: vec!["Craft".into()],
+            stage: if app.unavailable {
+                "Unavailable"
+            } else {
+                "New"
+            }
+            .into(),
+            executable_name: app.repository.to_ascii_lowercase(),
+            github_id: app.github_id,
+            unavailable: app.unavailable,
+            discovered: true,
+        });
+    }
+    products
+}
+
+#[cfg(test)]
+mod product_tests {
+    use super::*;
+    use crate::workspace::DiscoveredApp;
+
+    fn discovered(id: &str, repo: &str) -> DiscoveredApp {
+        DiscoveredApp {
+            app_id: id.into(),
+            github_id: Some(42),
+            unavailable: false,
+            repository: repo.into(),
+            description: "A new app".into(),
+        }
+    }
+
+    #[test]
+    fn owned_catalog_includes_discovery_and_rejects_path_and_builtin_collisions() {
+        let products = products(&[
+            discovered("newcraft", "NewCraft"),
+            discovered("../escape", "SafeCraft"),
+            discovered("photocraft", "OtherCraft"),
+            discovered("othercraft", "pdfcraft"),
+        ]);
+        assert_eq!(products.len(), CATALOG.len() + 1);
+        let new = products.iter().find(|p| p.id == "newcraft").unwrap();
+        assert_eq!(new.repository, "NewCraft");
+        assert_eq!(new.github_id, Some(42));
+        assert!(new.discovered);
+        let pdf = products.iter().find(|p| p.id == "printcraft").unwrap();
+        assert_eq!(pdf.repository, "pdfcraft");
+        assert!(!pdf.discovered);
     }
 }

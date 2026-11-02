@@ -21,6 +21,8 @@ struct Fixture {
     checksum_bad: bool,
     network_bad: bool,
     cancel_download: bool,
+    download_count: usize,
+    native_arch: bool,
 }
 fn archive(contents: &[u8]) -> Vec<u8> {
     let encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -59,6 +61,9 @@ impl Remote for FakeRemote {
             return Err(fail("offline fixture"));
         }
         Ok(vec![workspace::DiscoveredApp {
+            app_id: "newcraft".into(),
+            github_id: Some(42),
+            unavailable: false,
             repository: "NewCraft".into(),
             description: "New app".into(),
         }])
@@ -76,6 +81,9 @@ impl Remote for FakeRemote {
         let mut release = release(&fixture.version, fixture.bytes.len());
         for asset in &mut release.assets {
             asset.name = asset.name.replace("photocraft", id);
+            if fixture.native_arch {
+                asset.name = asset.name.replace("x86_64", std::env::consts::ARCH);
+            }
             asset.browser_download_url = asset.browser_download_url.replace("photocraft", id);
         }
         Ok(ReleaseCache {
@@ -103,7 +111,8 @@ impl Remote for FakeRemote {
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(f32),
     ) -> Result<String> {
-        let fixture = self.0.lock().unwrap();
+        let mut fixture = self.0.lock().unwrap();
+        fixture.download_count += 1;
         fs::write(path, &fixture.bytes)?;
         progress(100.0);
         if fixture.cancel_download {
@@ -172,6 +181,8 @@ fn setup(root: &Path) -> (Manager, Arc<Mutex<Fixture>>, Arc<AtomicBool>) {
         checksum_bad: false,
         network_bad: false,
         cancel_download: false,
+        download_count: 0,
+        native_arch: false,
     }));
     let running = Arc::new(AtomicBool::new(false));
     let mut manager = Manager::with_services(
@@ -242,6 +253,251 @@ fn install_update_reload_rollback_and_remove_keep_documents() {
     let (manager, _, _) = setup(&root);
     assert!(manager.state.installations.is_empty());
 }
+#[test]
+fn deferred_installer_inventory_covers_files_created_during_activation_and_rollback() {
+    struct DeferredPlatform;
+    impl Platform for DeferredPlatform {
+        fn os(&self) -> &str {
+            "linux"
+        }
+        fn arch(&self) -> &str {
+            "x86_64"
+        }
+        fn is_running(&self, _: &Path) -> Result<bool> {
+            Ok(false)
+        }
+        fn launch(&self, _: &Path) -> Result<Option<u32>> {
+            Ok(None)
+        }
+        fn unpack(
+            &self,
+            _: &str,
+            _: PackageKind,
+            _: &Path,
+            stage: &Path,
+            _: &AtomicBool,
+        ) -> Result<(PathBuf, Option<PathBuf>)> {
+            fs::create_dir_all(stage.join("payload"))?;
+            fs::write(stage.join("setup.exe"), b"installer")?;
+            Ok((
+                PathBuf::from("payload/photocraft"),
+                Some(PathBuf::from("setup.exe")),
+            ))
+        }
+        fn finish_installer(&self, _: &Path, app: &Path) -> Result<()> {
+            fs::write(app, b"installed application")?;
+            Ok(())
+        }
+        fn shortcut(&self, _: &str, _: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn remove_shortcut(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn autostart(&self, _: bool, _: &Path, _: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, fixture, _) = setup(tmp.path());
+    drop(manager);
+    let mut manager = Manager::with_services(
+        tmp.path().into(),
+        Box::new(FakeRemote(fixture.clone())),
+        Box::new(DeferredPlatform),
+    )
+    .unwrap();
+    install(&mut manager);
+    assert!(
+        manager
+            .check_installation("photocraft")
+            .unwrap()
+            .contains("verified")
+    );
+    let executable = manager
+        .executable("photocraft", &manager.state.installations["photocraft"])
+        .unwrap();
+    fs::write(&executable, b"corrupted application").unwrap();
+    assert!(manager.check_installation("photocraft").is_err());
+    fixture.lock().unwrap().version = "v2.0.0".into();
+    install(&mut manager);
+    manager.rollback("photocraft").unwrap();
+    assert!(
+        manager
+            .check_installation("photocraft")
+            .unwrap()
+            .contains("verified")
+    );
+    let executable = manager
+        .executable("photocraft", &manager.state.installations["photocraft"])
+        .unwrap();
+    fs::write(executable, b"corrupted application").unwrap();
+    assert!(manager.check_installation("photocraft").is_err());
+}
+
+#[test]
+fn integrity_check_and_repair_preserve_pins_and_defer_running_app() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, _, running) = setup(tmp.path());
+    install(&mut manager);
+    assert!(
+        manager
+            .check_installation("photocraft")
+            .unwrap()
+            .contains("verified")
+    );
+    let path = manager
+        .executable("photocraft", &manager.state.installations["photocraft"])
+        .unwrap();
+    fs::write(&path, b"damaged").unwrap();
+    assert!(manager.check_installation("photocraft").is_err());
+    let preferences = manager.preferences("photocraft");
+    running.store(true, Ordering::Relaxed);
+    manager
+        .repair("photocraft", &AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    assert!(manager.state.pending.contains_key("photocraft"));
+    assert_eq!(fs::read(&path).unwrap(), b"damaged");
+    running.store(false, Ordering::Relaxed);
+    assert!(manager.activate_pending("photocraft").unwrap());
+    assert!(
+        manager
+            .check_installation("photocraft")
+            .unwrap()
+            .contains("verified")
+    );
+    assert_eq!(
+        manager.preferences("photocraft").pinned_version,
+        preferences.pinned_version
+    );
+}
+
+#[test]
+fn repair_does_not_modify_linked_installations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, _, _) = setup(tmp.path());
+    let executable = tmp.path().join("external");
+    fs::write(&executable, b"external content").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    manager.link("photocraft", executable.clone()).unwrap();
+    assert!(
+        manager
+            .repair("photocraft", &AtomicBool::new(false), &mut |_| {})
+            .is_err()
+    );
+    assert_eq!(fs::read(executable).unwrap(), b"external content");
+}
+
+#[test]
+fn cache_cleanup_removes_only_selected_unreferenced_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _, _) = setup(tmp.path());
+    let protected_id = queue::new_id();
+    let orphan_id = queue::new_id();
+    let name = format!("{}.part", "a".repeat(64));
+    for id in [&protected_id, &orphan_id] {
+        let dir = tmp.path().join("downloads").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(&name), b"partial data").unwrap();
+    }
+    queue::save(
+        tmp.path(),
+        &[queue::QueueEntry {
+            id: protected_id.clone(),
+            action: queue::QueueAction::Install {
+                id: "photocraft".into(),
+                version: None,
+            },
+            status: queue::QueueStatus::Paused,
+            checkpoint: None,
+        }],
+    )
+    .unwrap();
+    let report = manager.storage_report().unwrap();
+    let protected = format!("{protected_id}/{name}");
+    let orphan = format!("{orphan_id}/{name}");
+    assert!(
+        report
+            .downloads
+            .iter()
+            .find(|f| f.name == protected)
+            .unwrap()
+            .protected
+    );
+    assert!(
+        !report
+            .downloads
+            .iter()
+            .find(|f| f.name == orphan)
+            .unwrap()
+            .protected
+    );
+    assert!(
+        manager
+            .remove_cached_downloads(&[orphan.clone(), protected.clone()])
+            .is_err()
+    );
+    assert!(tmp.path().join("downloads").join(&orphan).exists());
+    assert!(
+        manager
+            .remove_cached_downloads(&["../../outside".into()])
+            .is_err()
+    );
+    assert_eq!(
+        manager
+            .remove_cached_downloads(std::slice::from_ref(&orphan))
+            .unwrap(),
+        1
+    );
+    assert!(!tmp.path().join("downloads").join(orphan).exists());
+    assert!(tmp.path().join("downloads").join(protected).exists());
+}
+
+#[test]
+fn storage_report_and_rollback_cleanup_preserve_active_and_external_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, _) = setup(tmp.path());
+    install(&mut manager);
+    fixture.lock().unwrap().version = "v2.0.0".into();
+    install(&mut manager);
+    let active = manager
+        .executable("photocraft", &manager.state.installations["photocraft"])
+        .unwrap();
+    let previous = manager.state.installations["photocraft"]
+        .previous
+        .as_ref()
+        .unwrap()
+        .clone();
+    let old_dir = manager
+        .managed_path("photocraft", &previous.directory)
+        .unwrap();
+    let doc = tmp.path().join("my-project.psd");
+    fs::write(&doc, b"my content").unwrap();
+    let report = manager.storage_report().unwrap();
+    let app = report
+        .apps
+        .iter()
+        .find(|app| app.id == "photocraft")
+        .unwrap();
+    assert!(app.active_bytes > 0 && app.rollback_bytes > 0);
+    assert_eq!(app.rollback_version.as_deref(), Some("v1.0.0"));
+    assert!(
+        manager
+            .remove_rollback("photocraft", "wrong-version")
+            .is_err()
+    );
+    assert!(old_dir.exists());
+    manager.remove_rollback("photocraft", "v1.0.0").unwrap();
+    assert!(!old_dir.exists());
+    assert!(active.exists());
+    assert!(manager.state.installations["photocraft"].previous.is_none());
+    assert_eq!(fs::read(doc).unwrap(), b"my content");
+}
+
 #[test]
 fn checksum_failure_and_cancellation_preserve_old_installation() {
     let tmp = tempfile::tempdir().unwrap();
@@ -868,6 +1124,31 @@ fn reviewed_updates_obey_pins_reject_stale_previews_and_do_not_create_pins() {
 
 #[cfg(unix)]
 #[test]
+fn startup_failure_is_reported_but_successful_early_exit_is_not_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let failed = tmp.path().join("failed");
+    fs::write(&failed, b"#!/bin/sh\nexit 7\n").unwrap();
+    installer::make_executable(&failed).unwrap();
+    let error = Native.launch(&failed).unwrap_err().to_string();
+    assert!(error.contains('7'), "{error}");
+    let ok = tmp.path().join("ok");
+    fs::write(&ok, b"#!/bin/sh\nexit 0\n").unwrap();
+    installer::make_executable(&ok).unwrap();
+    assert!(Native.launch(&ok).is_ok());
+    let (mut manager, _, _) = setup(&tmp.path().join("library"));
+    manager.link("photocraft", failed).unwrap();
+    assert!(manager.launch("photocraft").is_err());
+    assert!(
+        manager
+            .state
+            .activity
+            .iter()
+            .any(|event| event.action == "launch" && event.error && event.message.contains('7'))
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn project_arguments_are_literal_and_recent_history_survives_reload() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("library");
@@ -949,6 +1230,35 @@ fn local_discovery_finds_known_apps_without_executing_them_and_ignores_wrappers(
 }
 
 #[test]
+fn bulk_refresh_reports_failures_and_keeps_cached_release_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, _) = setup(tmp.path());
+    manager.refresh_app("photocraft").unwrap();
+    let previous = manager.state.releases["photocraft"]
+        .release
+        .as_ref()
+        .unwrap()
+        .tag_name
+        .clone();
+    fixture.lock().unwrap().network_bad = true;
+    let error = manager
+        .refresh_all(&AtomicBool::new(false), &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("release checks failed"));
+    assert!(error.contains("offline fixture"));
+    assert_eq!(
+        manager.state.releases["photocraft"]
+            .release
+            .as_ref()
+            .unwrap()
+            .tag_name,
+        previous
+    );
+    assert!(manager.state.releases["photocraft"].error.is_some());
+}
+
+#[test]
 fn offline_product_discovery_preserves_previous_results() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut manager, fixture, _) = setup(tmp.path());
@@ -966,6 +1276,459 @@ fn offline_product_discovery_preserves_previous_results() {
 }
 
 #[test]
+fn discovered_product_is_refreshed_and_downloaded_without_a_builtin_catalog_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, _) = setup(&tmp.path().join("library"));
+    manager.discover_products(&AtomicBool::new(false)).unwrap();
+    manager
+        .refresh_all(&AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    assert!(manager.state.releases.contains_key("newcraft"));
+    let downloads = tmp.path().join("downloads");
+    assert_eq!(
+        manager
+            .download_packages(
+                &["newcraft".into()],
+                &downloads,
+                &AtomicBool::new(false),
+                &mut |_| {}
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fs::read(downloads.join("newcraft-v1.0.0-linux-x86_64.tar.gz")).unwrap(),
+        fixture.lock().unwrap().bytes
+    );
+}
+
+#[test]
+fn schema_migration_backs_up_original_and_preserves_user_preferences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let original = r#"{"schema":1,"preferences":{"photocraft":{"favorite":true,"pinned_version":"v1.0.0"}},"discovered_apps":[{"repository":"NewCraft","description":"test"}]}"#;
+    fs::write(tmp.path().join("state.json"), original).unwrap();
+    let (manager, _, _) = setup(tmp.path());
+    assert_eq!(manager.state.schema, model::STATE_SCHEMA);
+    assert!(manager.preferences("photocraft").favorite);
+    assert_eq!(
+        manager.preferences("photocraft").pinned_version.as_deref(),
+        Some("v1.0.0")
+    );
+    assert_eq!(manager.state.discovered_apps[0].app_id, "newcraft");
+    let backups: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("state-before-schema-1-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read_to_string(backups[0].path()).unwrap(), original);
+    let saved: State =
+        serde_json::from_slice(&fs::read(tmp.path().join("state.json")).unwrap()).unwrap();
+    assert_eq!(saved.schema, model::STATE_SCHEMA);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_reports_choices_and_preserves_verified_archive_for_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, fixture, _) = setup(tmp.path());
+    drop(manager);
+    let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let mut archive = tar::Builder::new(encoder);
+    for path in ["one/photocraft", "two/photocraft"] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, path, &b"test"[..])
+            .unwrap();
+    }
+    {
+        let mut fixture = fixture.lock().unwrap();
+        fixture.bytes = archive.into_inner().unwrap().finish().unwrap();
+        fixture.native_arch = true;
+    }
+    let mut manager = Manager::with_services(
+        tmp.path().into(),
+        Box::new(FakeRemote(fixture)),
+        Box::new(Native),
+    )
+    .unwrap();
+    manager.state.settings.check_on_startup = false;
+    manager.refresh_app("photocraft").unwrap();
+    let worker = Worker::new(manager, PathBuf::from("launcher"));
+    let task_key = queue::new_id();
+    worker
+        .send(Command::Queued {
+            id: 5,
+            task_key: task_key.clone(),
+            checkpoint: None,
+            command: Box::new(Command::Install {
+                id: "photocraft".into(),
+                version: None,
+            }),
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut paths = None;
+    loop {
+        assert!(std::time::Instant::now() < deadline);
+        match worker
+            .events
+            .recv_timeout(std::time::Duration::from_millis(200))
+        {
+            Ok(Event::Entrypoints {
+                app_id,
+                paths: found,
+            }) => {
+                assert_eq!(app_id, "photocraft");
+                paths = Some(found);
+            }
+            Ok(Event::TaskFinished { id: 5, result }) => {
+                assert!(result.is_err());
+                break;
+            }
+            _ => {}
+        }
+    }
+    let paths = paths.expect("choice event must precede failure");
+    assert_eq!(paths, vec!["one/photocraft", "two/photocraft"]);
+    assert!(
+        fs::read_dir(tmp.path().join("downloads").join(task_key))
+            .unwrap()
+            .next()
+            .is_some()
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_unpack_requires_a_choice_for_ambiguous_application_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let mut archive = tar::Builder::new(encoder);
+    for path in ["one/newcraft", "two/newcraft"] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, path, &b"test"[..])
+            .unwrap();
+    }
+    let archive_path = tmp.path().join("package.tar.gz");
+    fs::write(
+        &archive_path,
+        archive.into_inner().unwrap().finish().unwrap(),
+    )
+    .unwrap();
+    let product = catalog::products(&[workspace::DiscoveredApp {
+        app_id: "newcraft".into(),
+        github_id: Some(42),
+        unavailable: false,
+        repository: "NewCraft".into(),
+        description: String::new(),
+    }])
+    .pop()
+    .unwrap();
+    let first = tmp.path().join("first");
+    fs::create_dir(&first).unwrap();
+    let error = Native
+        .unpack_product_with_entrypoint(
+            &product,
+            PackageKind::TarGz,
+            &archive_path,
+            &first,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Multiple application entries"));
+    let second = tmp.path().join("second");
+    fs::create_dir(&second).unwrap();
+    let (path, _) = Native
+        .unpack_product_with_entrypoint(
+            &product,
+            PackageKind::TarGz,
+            &archive_path,
+            &second,
+            &AtomicBool::new(false),
+            Some("two/newcraft"),
+        )
+        .unwrap();
+    assert_eq!(fs::read(second.join(path)).unwrap(), b"test");
+}
+
+#[test]
+fn discovered_product_install_update_reload_rollback_and_remove() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("library");
+    let (mut manager, fixture, running) = setup(&root);
+    let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    let bytes = b"#!/bin/sh\nexit 0\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "newcraft", &bytes[..])
+        .unwrap();
+    fixture.lock().unwrap().bytes = builder.into_inner().unwrap().finish().unwrap();
+    manager.discover_products(&AtomicBool::new(false)).unwrap();
+    manager.refresh_app("newcraft").unwrap();
+    manager
+        .stage_install("newcraft", None, &AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    assert_eq!(manager.state.installations["newcraft"].version, "v1.0.0");
+    fixture.lock().unwrap().version = "v2.0.0".into();
+    manager.refresh_app("newcraft").unwrap();
+    assert_eq!(
+        workspace::update_preview(&manager.snapshot())[0].app_id,
+        "newcraft"
+    );
+    manager
+        .stage_install("newcraft", None, &AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    drop(manager);
+    let mut manager = Manager::with_services(
+        root,
+        Box::new(FakeRemote(fixture)),
+        Box::new(FakePlatform { running }),
+    )
+    .unwrap();
+    assert_eq!(manager.state.installations["newcraft"].version, "v2.0.0");
+    manager.rollback("newcraft").unwrap();
+    assert_eq!(manager.state.installations["newcraft"].version, "v1.0.0");
+    manager.remove("newcraft").unwrap();
+    assert!(!manager.state.installations.contains_key("newcraft"));
+}
+
+#[test]
+fn discovery_preserves_stable_identity_on_rename_and_retains_missing_repositories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, _, _) = setup(tmp.path());
+    manager.state.discovered_apps = vec![
+        workspace::DiscoveredApp {
+            app_id: "oldcraft".into(),
+            github_id: Some(42),
+            unavailable: false,
+            repository: "OldCraft".into(),
+            description: "old".into(),
+        },
+        workspace::DiscoveredApp {
+            app_id: "missingcraft".into(),
+            github_id: Some(43),
+            unavailable: false,
+            repository: "MissingCraft".into(),
+            description: "missing".into(),
+        },
+    ];
+    manager.discover_products(&AtomicBool::new(false)).unwrap();
+    let renamed = manager
+        .state
+        .discovered_apps
+        .iter()
+        .find(|app| app.github_id == Some(42))
+        .unwrap();
+    assert_eq!(renamed.repository, "NewCraft");
+    assert_eq!(renamed.app_id, "oldcraft");
+    assert!(!renamed.unavailable);
+    assert!(
+        manager
+            .state
+            .discovered_apps
+            .iter()
+            .find(|app| app.github_id == Some(43))
+            .unwrap()
+            .unavailable
+    );
+    drop(manager);
+    let (manager, _, _) = setup(tmp.path());
+    assert_eq!(
+        manager
+            .state
+            .discovered_apps
+            .iter()
+            .find(|app| app.github_id == Some(42))
+            .unwrap()
+            .app_id,
+        "oldcraft"
+    );
+}
+
+#[test]
+fn resumed_queue_confirms_completed_install_without_downloading_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, running) = setup(tmp.path());
+    manager.state.settings.check_on_startup = false;
+    manager.refresh_app("photocraft").unwrap();
+    let checkpoint = queue::QueueCheckpoint {
+        version: "v1.0.0".into(),
+        previous_install_directory: None,
+        previous_pending_directory: None,
+    };
+    let task_key = queue::new_id();
+    queue::save(
+        tmp.path(),
+        &[queue::QueueEntry {
+            id: task_key.clone(),
+            action: queue::QueueAction::Install {
+                id: "photocraft".into(),
+                version: None,
+            },
+            status: queue::QueueStatus::Running,
+            checkpoint: Some(checkpoint.clone()),
+        }],
+    )
+    .unwrap();
+    fn run(worker: &Worker, task_key: &str, checkpoint: queue::QueueCheckpoint) -> String {
+        worker
+            .send(Command::Queued {
+                id: 17,
+                task_key: task_key.into(),
+                checkpoint: Some(checkpoint),
+                command: Box::new(Command::Install {
+                    id: "photocraft".into(),
+                    version: None,
+                }),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if let Ok(Event::TaskFinished { id: 17, result }) = worker
+                .events
+                .recv_timeout(std::time::Duration::from_millis(200))
+            {
+                return result.unwrap();
+            }
+        }
+    }
+    let worker = Worker::new(manager, PathBuf::from("launcher"));
+    assert_eq!(run(&worker, &task_key, checkpoint.clone()), "App ready.");
+    drop(worker);
+    assert_eq!(fixture.lock().unwrap().download_count, 1);
+    let restored = queue::load(tmp.path()).unwrap();
+    assert_eq!(restored[0].status, queue::QueueStatus::Paused);
+    let manager = Manager::with_services(
+        tmp.path().into(),
+        Box::new(FakeRemote(fixture.clone())),
+        Box::new(FakePlatform { running }),
+    )
+    .unwrap();
+    let worker = Worker::new(manager, PathBuf::from("launcher"));
+    assert!(
+        run(&worker, &task_key, restored[0].checkpoint.clone().unwrap())
+            .contains("Previously completed")
+    );
+    drop(worker);
+    assert_eq!(fixture.lock().unwrap().download_count, 1);
+}
+
+#[test]
+fn resumed_queue_activates_previously_staged_update_without_downloading_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, running) = setup(tmp.path());
+    manager.state.settings.check_on_startup = false;
+    install(&mut manager);
+    fixture.lock().unwrap().version = "v2.0.0".into();
+    manager.refresh_app("photocraft").unwrap();
+    let checkpoint = queue::QueueCheckpoint {
+        version: "v2.0.0".into(),
+        previous_install_directory: manager.state.installations["photocraft"].directory.clone(),
+        previous_pending_directory: None,
+    };
+    running.store(true, Ordering::Relaxed);
+    let task_key = queue::new_id();
+    fn run(worker: &Worker, key: &str, checkpoint: queue::QueueCheckpoint) -> String {
+        worker
+            .send(Command::Queued {
+                id: 18,
+                task_key: key.into(),
+                checkpoint: Some(checkpoint),
+                command: Box::new(Command::Install {
+                    id: "photocraft".into(),
+                    version: None,
+                }),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if let Ok(Event::TaskFinished { id: 18, result }) = worker
+                .events
+                .recv_timeout(std::time::Duration::from_millis(200))
+            {
+                return result.unwrap();
+            }
+        }
+    }
+    let worker = Worker::new(manager, PathBuf::from("launcher"));
+    assert!(run(&worker, &task_key, checkpoint.clone()).contains("activate"));
+    drop(worker);
+    assert_eq!(fixture.lock().unwrap().download_count, 2);
+    running.store(false, Ordering::Relaxed);
+    let manager = Manager::with_services(
+        tmp.path().into(),
+        Box::new(FakeRemote(fixture.clone())),
+        Box::new(FakePlatform { running }),
+    )
+    .unwrap();
+    assert!(manager.state.pending.contains_key("photocraft"));
+    let worker = Worker::new(manager, PathBuf::from("launcher"));
+    assert!(run(&worker, &task_key, checkpoint).contains("activated"));
+    drop(worker);
+    assert_eq!(fixture.lock().unwrap().download_count, 2);
+}
+
+#[test]
+fn interrupted_queue_download_keeps_owned_cache_until_explicit_discard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, _) = setup(tmp.path());
+    manager.state.settings.check_on_startup = false;
+    manager.refresh_app("photocraft").unwrap();
+    fixture.lock().unwrap().cancel_download = true;
+    let worker = Worker::new(manager, PathBuf::from("launcher"));
+    let task_key = queue::new_id();
+    worker
+        .send(Command::Queued {
+            id: 12,
+            task_key: task_key.clone(),
+            checkpoint: None,
+            command: Box::new(Command::Install {
+                id: "photocraft".into(),
+                version: None,
+            }),
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        assert!(std::time::Instant::now() < deadline);
+        if let Ok(Event::TaskFinished { id, result }) = worker
+            .events
+            .recv_timeout(std::time::Duration::from_millis(200))
+        {
+            assert_eq!(id, 12);
+            assert!(result.unwrap_err().to_lowercase().contains("cancelled"));
+            break;
+        }
+    }
+    let owned = tmp.path().join("downloads").join(&task_key);
+    assert!(std::fs::read_dir(&owned).unwrap().next().is_some());
+    drop(worker);
+    assert!(owned.exists());
+    queue::discard_partial(tmp.path(), &task_key).unwrap();
+    assert!(!owned.exists());
+}
+
+#[test]
 fn queued_tasks_report_their_own_ids_and_can_continue_after_a_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut manager, fixture, _) = setup(tmp.path());
@@ -980,6 +1743,8 @@ fn queued_tasks_report_their_own_ids_and_can_continue_after_a_failure() {
         worker
             .send(Command::Queued {
                 id,
+                task_key: queue::new_id(),
+                checkpoint: None,
                 command: Box::new(Command::Install {
                     id: "photocraft".into(),
                     version: None,
