@@ -22,6 +22,7 @@ struct Fixture {
     network_bad: bool,
     cancel_download: bool,
     download_count: usize,
+    native_arch: bool,
 }
 fn archive(contents: &[u8]) -> Vec<u8> {
     let encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -80,6 +81,9 @@ impl Remote for FakeRemote {
         let mut release = release(&fixture.version, fixture.bytes.len());
         for asset in &mut release.assets {
             asset.name = asset.name.replace("photocraft", id);
+            if fixture.native_arch {
+                asset.name = asset.name.replace("x86_64", std::env::consts::ARCH);
+            }
             asset.browser_download_url = asset.browser_download_url.replace("photocraft", id);
         }
         Ok(ReleaseCache {
@@ -178,6 +182,7 @@ fn setup(root: &Path) -> (Manager, Arc<Mutex<Fixture>>, Arc<AtomicBool>) {
         network_bad: false,
         cancel_download: false,
         download_count: 0,
+        native_arch: false,
     }));
     let running = Arc::new(AtomicBool::new(false));
     let mut manager = Manager::with_services(
@@ -1343,7 +1348,11 @@ fn worker_reports_choices_and_preserves_verified_archive_for_retry() {
             .append_data(&mut header, path, &b"test"[..])
             .unwrap();
     }
-    fixture.lock().unwrap().bytes = archive.into_inner().unwrap().finish().unwrap();
+    {
+        let mut fixture = fixture.lock().unwrap();
+        fixture.bytes = archive.into_inner().unwrap().finish().unwrap();
+        fixture.native_arch = true;
+    }
     let mut manager = Manager::with_services(
         tmp.path().into(),
         Box::new(FakeRemote(fixture)),
