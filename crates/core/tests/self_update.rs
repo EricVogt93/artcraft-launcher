@@ -348,7 +348,7 @@ fn helper_integrity_failure_restores_the_old_process_and_bootstrap() {
         Some(previous)
     );
     for _ in 0..50 {
-        if marker.exists() {
+        if fs::read_to_string(&marker).is_ok_and(|value| value == "restored") {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

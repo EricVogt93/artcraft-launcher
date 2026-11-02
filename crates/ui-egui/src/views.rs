@@ -3,11 +3,56 @@ use crate::{
     widgets::{self, ButtonKind, CONTROL_HEIGHT},
 };
 use craftlauncher_core::{
-    App, AppPreferences, CATALOG, Channel, Command, Theme, model::is_newer, releases::asset_for,
+    AppPreferences, Channel, Command, Theme,
+    catalog::{DISCIPLINES, Product},
+    model::is_newer,
+    releases::{
+        AssetResolution, ChecksumSource, asset_preference_key, checksum_source, resolve_asset,
+    },
     self_update,
 };
 use egui::{Align, Color32, Context, Frame, Layout, RichText, Stroke, Ui, Vec2};
 use std::time::Instant;
+
+#[derive(Clone, Copy)]
+struct App<'a> {
+    id: &'a str,
+    name: &'a str,
+    category: &'a str,
+    discipline: &'a str,
+    description: &'a str,
+    detail: &'a str,
+    color: [u8; 3],
+    tags: &'a [String],
+    stage: &'a str,
+    repository: &'a str,
+    executable_name: &'a str,
+}
+impl<'a> From<&'a Product> for App<'a> {
+    fn from(p: &'a Product) -> Self {
+        Self {
+            id: &p.id,
+            name: &p.name,
+            category: &p.category,
+            discipline: &p.discipline,
+            description: &p.description,
+            detail: &p.detail,
+            color: p.color,
+            tags: &p.tags,
+            stage: &p.stage,
+            repository: &p.repository,
+            executable_name: &p.executable_name,
+        }
+    }
+}
+impl<'a> App<'a> {
+    fn repository(self) -> &'a str {
+        self.repository
+    }
+    fn executable_name(self) -> &'a str {
+        self.executable_name
+    }
+}
 
 impl Launcher {
     pub(crate) fn sidebar(&mut self, root: &mut Ui) {
@@ -20,80 +65,113 @@ impl Launcher {
                     .inner_margin(egui::Margin::symmetric(18, 24)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    self.brand(ui, 30.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new("CRAFT").size(16.0).strong());
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar-scroll")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            self.brand(ui, 30.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(RichText::new("CRAFT").size(16.0).strong());
+                                ui.label(
+                                    RichText::new("LAUNCHER")
+                                        .size(10.0)
+                                        .color(self.palette.muted),
+                                );
+                            });
+                        });
+                        ui.add_space(44.0);
                         ui.label(
-                            RichText::new("LAUNCHER")
-                                .size(10.0)
-                                .color(self.palette.muted),
+                            RichText::new("YOUR WORKSPACE")
+                                .monospace()
+                                .size(9.0)
+                                .color(self.palette.faint),
                         );
+                        ui.add_space(10.0);
+                        let installed = self.snapshot.state.installations.len();
+                        let updates = self.update_count();
+                        for (page, name, count) in [
+                            (Page::MyApps, "My apps", Some(installed)),
+                            (Page::AllApps, "All apps", None),
+                            (Page::Updates, "Updates", Some(updates)),
+                            (
+                                Page::Queue,
+                                "Queue",
+                                Some(
+                                    self.workflows
+                                        .tasks
+                                        .iter()
+                                        .filter(|task| {
+                                            matches!(
+                                                task.status,
+                                                crate::workflows::TaskStatus::Waiting
+                                                    | crate::workflows::TaskStatus::Running
+                                            )
+                                        })
+                                        .count(),
+                                ),
+                            ),
+                            (
+                                Page::Discover,
+                                "Discover",
+                                Some(self.snapshot.state.discovered_apps.len()),
+                            ),
+                            (Page::Activity, "Activity", None),
+                        ] {
+                            if widgets::nav_button(
+                                ui,
+                                self.palette,
+                                page,
+                                name,
+                                self.page == page,
+                                count,
+                            )
+                            .clicked()
+                            {
+                                self.page = page;
+                                self.search.clear();
+                            }
+                        }
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.add_space(2.0);
+                            if widgets::nav_button(
+                                ui,
+                                self.palette,
+                                Page::Settings,
+                                "Settings",
+                                self.page == Page::Settings,
+                                None,
+                            )
+                            .clicked()
+                            {
+                                self.page = Page::Settings;
+                            }
+                            ui.add_space(20.0);
+                            ui.separator();
+                            ui.add_space(18.0);
+                            ui.label(
+                                RichText::new("Made for making.")
+                                    .font(theme::italic(23.0))
+                                    .color(self.palette.muted),
+                            );
+                            ui.label(
+                                RichText::new("Open tools. Endless possibilities.")
+                                    .size(10.0)
+                                    .color(self.palette.faint),
+                            );
+                            ui.add_space(18.0);
+                            if ui
+                                .link(
+                                    RichText::new("Meet the Craft family ↗")
+                                        .size(11.0)
+                                        .color(self.palette.muted),
+                                )
+                                .clicked()
+                            {
+                                self.external("https://getartcraft.com/apps".into());
+                            }
+                        });
                     });
-                });
-                ui.add_space(44.0);
-                ui.label(
-                    RichText::new("YOUR WORKSPACE")
-                        .monospace()
-                        .size(9.0)
-                        .color(self.palette.faint),
-                );
-                ui.add_space(10.0);
-                let installed = self.snapshot.state.installations.len();
-                let updates = self.update_count();
-                for (page, name, count) in [
-                    (Page::MyApps, "My apps", Some(installed)),
-                    (Page::AllApps, "All apps", None),
-                    (Page::Updates, "Updates", Some(updates)),
-                    (Page::Activity, "Activity", None),
-                ] {
-                    if widgets::nav_button(ui, self.palette, page, name, self.page == page, count)
-                        .clicked()
-                    {
-                        self.page = page;
-                        self.search.clear();
-                    }
-                }
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    ui.add_space(2.0);
-                    if widgets::nav_button(
-                        ui,
-                        self.palette,
-                        Page::Settings,
-                        "Settings",
-                        self.page == Page::Settings,
-                        None,
-                    )
-                    .clicked()
-                    {
-                        self.page = Page::Settings;
-                    }
-                    ui.add_space(20.0);
-                    ui.separator();
-                    ui.add_space(18.0);
-                    ui.label(
-                        RichText::new("Made for making.")
-                            .font(theme::italic(23.0))
-                            .color(self.palette.muted),
-                    );
-                    ui.label(
-                        RichText::new("Open tools. Endless possibilities.")
-                            .size(10.0)
-                            .color(self.palette.faint),
-                    );
-                    ui.add_space(18.0);
-                    if ui
-                        .link(
-                            RichText::new("Meet the Craft family ↗")
-                                .size(11.0)
-                                .color(self.palette.muted),
-                        )
-                        .clicked()
-                    {
-                        self.external("https://getartcraft.com/apps".into());
-                    }
-                });
             });
     }
     pub(crate) fn topbar(&mut self, ui: &mut Ui) {
@@ -104,6 +182,8 @@ impl Launcher {
                     Page::AllApps => "DISCOVER / CRAFT APPS",
                     Page::Updates => "WORKSPACE / UPDATES",
                     Page::Activity => "WORKSPACE / ACTIVITY",
+                    Page::Queue => "WORKSPACE / QUEUE",
+                    Page::Discover => "DISCOVER / NEW & LOCAL",
                     Page::Settings => "WORKSPACE / SETTINGS",
                 })
                 .monospace()
@@ -136,12 +216,22 @@ impl Launcher {
             ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(size)));
         } else {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect.shrink(2.0), 12.0, self.palette.accent);
+            let app = self
+                .snapshot
+                .products
+                .iter()
+                .find(|app| app.id == id)
+                .map(App::from);
+            let color = app
+                .map(|app| Color32::from_rgb(app.color[0], app.color[1], app.color[2]))
+                .unwrap_or(self.palette.accent);
+            ui.painter().rect_filled(rect.shrink(2.0), 12.0, color);
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "A",
+                app.and_then(|app| app.name.chars().next())
+                    .unwrap_or('A')
+                    .to_string(),
                 egui::FontId::proportional(size * 0.65),
                 Color32::WHITE,
             );
@@ -150,7 +240,7 @@ impl Launcher {
     fn primary(&self, ui: &mut Ui, text: &str, enabled: bool) -> bool {
         widgets::button(ui, self.palette, text, ButtonKind::Primary, enabled, 104.0).clicked()
     }
-    fn headline(&self, ui: &mut Ui, title: &str, description: &str) {
+    pub(crate) fn headline(&self, ui: &mut Ui, title: &str, description: &str) {
         ui.label(RichText::new(title).font(theme::display(43.0)));
         ui.add_space(6.0);
         ui.label(
@@ -194,13 +284,20 @@ impl Launcher {
                 "Your installed tools, together in one place.",
             );
         }
+        self.project_controls(ui, None);
+        ui.label(
+            RichText::new("Drop a project file here to choose a Craft app.")
+                .size(11.0)
+                .color(self.palette.muted),
+        );
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
             let filter_width = 186.0;
             let search_width = (ui.available_width() - filter_width - 12.0).max(180.0);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search your creative tools…   Ctrl / ⌘ K")
+                    .hint_text("Search your creative tools…")
                     .desired_width(search_width - 28.0)
                     .font(egui::FontId::proportional(13.0))
                     .min_size(Vec2::new(search_width, CONTROL_HEIGHT))
@@ -214,50 +311,45 @@ impl Launcher {
                     egui::StrokeKind::Inside,
                 );
             }
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
-                response.request_focus();
-            }
             egui::ComboBox::from_id_salt("discipline")
                 .selected_text(
-                    [
-                        "All disciplines",
-                        "Image & design",
-                        "Video & motion",
-                        "Documents",
-                    ][self.discipline],
+                    self.discipline
+                        .checked_sub(1)
+                        .and_then(|index| DISCIPLINES.get(index))
+                        .copied()
+                        .unwrap_or("All categories"),
                 )
                 .width(filter_width)
                 .show_ui(ui, |ui| {
-                    for (index, label) in [
-                        "All disciplines",
-                        "Image & design",
-                        "Video & motion",
-                        "Documents",
-                    ]
-                    .iter()
-                    .enumerate()
-                    {
-                        ui.selectable_value(&mut self.discipline, index, *label);
+                    ui.selectable_value(&mut self.discipline, 0, "All categories");
+                    for (index, label) in DISCIPLINES.iter().enumerate() {
+                        ui.selectable_value(&mut self.discipline, index + 1, *label);
                     }
                 });
         });
         ui.add_space(14.0);
         let search = self.search.to_lowercase();
-        let mut apps: Vec<App> = CATALOG
-            .into_iter()
+        let products = self.snapshot.products.clone();
+        let mut apps: Vec<App> = products
+            .iter()
+            .map(App::from)
             .filter(|app| {
                 let installed = self.snapshot.state.installations.contains_key(app.id);
-                let discipline = match self.discipline {
-                    1 => ["artcraft", "photocraft", "vectorcraft", "lightcraft"].contains(&app.id),
-                    2 => ["filmcraft", "effectcraft"].contains(&app.id),
-                    3 => ["printcraft", "designcraft"].contains(&app.id),
-                    _ => true,
-                };
+                let discipline = self.discipline == 0
+                    || DISCIPLINES
+                        .get(self.discipline - 1)
+                        .is_some_and(|label| *label == app.discipline);
                 (self.page == Page::AllApps || installed)
                     && discipline
-                    && format!("{} {} {}", app.name, app.category, app.tags.join(" "))
-                        .to_lowercase()
-                        .contains(&search)
+                    && format!(
+                        "{} {} {} {}",
+                        app.name,
+                        app.category,
+                        app.discipline,
+                        app.tags.join(" ")
+                    )
+                    .to_lowercase()
+                    .contains(&search)
             })
             .collect();
         apps.sort_by_key(|app| !self.preferences(app.id).favorite);
@@ -300,7 +392,7 @@ impl Launcher {
                         RichText::new(if self.search.is_empty() {
                             "Install a Craft app or link one you already have."
                         } else {
-                            "Try another name or discipline."
+                            "Try another name or category."
                         })
                         .color(self.palette.muted),
                     );
@@ -315,23 +407,40 @@ impl Launcher {
         self.batch_download_controls(ui, &apps);
         let columns = if ui.available_width() >= 620.0 { 2 } else { 1 };
         let width = (ui.available_width() - (columns - 1) as f32 * 14.0) / columns as f32;
-        for row in apps.chunks(columns) {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                for app in row {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(width, 182.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.scope_builder(
-                                egui::UiBuilder::new().id(egui::Id::new(("app-card", app.id))),
-                                |ui| self.card(ui, *app, width),
-                            );
-                        },
-                    );
-                }
-            });
-            ui.add_space(4.0);
+        for discipline in DISCIPLINES {
+            let grouped: Vec<App> = apps
+                .iter()
+                .copied()
+                .filter(|app| app.discipline == discipline)
+                .collect();
+            if grouped.is_empty() {
+                continue;
+            }
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(format!("{discipline} · {}", grouped.len()))
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(10.0);
+            for row in grouped.chunks(columns) {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    for app in row {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(width, 182.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.scope_builder(
+                                    egui::UiBuilder::new().id(egui::Id::new(("app-card", app.id))),
+                                    |ui| self.card(ui, *app, width),
+                                );
+                            },
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+            }
         }
         ui.add_space(18.0);
         ui.horizontal(|ui| {
@@ -402,7 +511,7 @@ impl Launcher {
                     self.palette,
                     &mut all,
                     "Select available",
-                    !eligible.is_empty() && !self.worker.busy(),
+                    !eligible.is_empty(),
                     partial,
                 )
                 .on_hover_text("Select all compatible packages in this view")
@@ -421,7 +530,7 @@ impl Launcher {
                     self.palette,
                     "Clear",
                     ButtonKind::Secondary,
-                    !self.worker.busy() && !self.selected_apps.is_empty(),
+                    !self.selected_apps.is_empty(),
                     64.0,
                 )
                 .clicked()
@@ -442,7 +551,7 @@ impl Launcher {
                         self.palette,
                         &text,
                         ButtonKind::Primary,
-                        !self.worker.busy() && !self.selected_apps.is_empty(),
+                        !self.selected_apps.is_empty(),
                         196.0,
                     )
                     .clicked()
@@ -515,7 +624,7 @@ impl Launcher {
         });
         ui.add_space(14.0);
     }
-    fn preferences(&self, id: &str) -> AppPreferences {
+    pub(crate) fn preferences(&self, id: &str) -> AppPreferences {
         self.snapshot
             .state
             .preferences
@@ -523,7 +632,7 @@ impl Launcher {
             .cloned()
             .unwrap_or_default()
     }
-    fn release(&self, id: &str) -> Option<&craftlauncher_core::Release> {
+    pub(crate) fn release(&self, id: &str) -> Option<&craftlauncher_core::Release> {
         let pref = self.preferences(id);
         let channel = pref.channel.unwrap_or(self.snapshot.state.settings.channel);
         let cache = self
@@ -542,10 +651,40 @@ impl Launcher {
             cache.release.as_ref()
         }
     }
+    fn selected_asset<'a>(
+        &self,
+        id: &str,
+        release: &'a craftlauncher_core::Release,
+    ) -> Option<&'a craftlauncher_core::Asset> {
+        let preferences = self.preferences(id);
+        let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+        resolve_asset(
+            release,
+            &self.snapshot.platform,
+            &self.snapshot.arch,
+            preferences.selected_assets.get(&key).map(String::as_str),
+        )
+        .selected()
+    }
     fn available(&self, id: &str) -> bool {
-        self.release(id)
-            .and_then(|release| asset_for(release, &self.snapshot.platform, &self.snapshot.arch))
-            .is_some()
+        !self
+            .snapshot
+            .products
+            .iter()
+            .any(|product| product.id == id && product.unavailable)
+            && self
+                .release(id)
+                .and_then(|release| {
+                    self.selected_asset(id, release)
+                        .map(|asset| (release, asset))
+                })
+                .is_some_and(|(release, asset)| {
+                    craftlauncher_core::platform::supports_managed(
+                        id,
+                        &self.snapshot.platform,
+                        asset,
+                    ) && !matches!(checksum_source(release, asset), ChecksumSource::Missing)
+                })
     }
     fn update_count(&self) -> usize {
         self.snapshot.state.pending.len()
@@ -612,7 +751,7 @@ impl Launcher {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if compatible {
                         let mut checked = selected;
-                        if widgets::checkbox(ui, self.palette, &mut checked, "", !self.worker.busy(), false).on_hover_text(format!("Select {} for download", app.name)).changed() {
+                        if widgets::checkbox(ui, self.palette, &mut checked, "", true, false).on_hover_text(format!("Select {} for download", app.name)).changed() {
                             if checked { self.selected_apps.insert(app.id.into()); } else { self.selected_apps.remove(app.id); }
                         }
                     }
@@ -626,7 +765,7 @@ impl Launcher {
                 ui.set_min_height(34.0);
                 ui.spacing_mut().item_spacing.y = 3.0;
                 ui.label(RichText::new(app.description).size(12.0).color(self.palette.muted));
-                if compatible && self.release(app.id).and_then(|release| asset_for(release, &self.snapshot.platform, &self.snapshot.arch)).is_some_and(|asset| asset.name.ends_with(".AppImage")) {
+                if compatible && self.release(app.id).and_then(|release| self.selected_asset(app.id, release)).is_some_and(|asset| asset.name.ends_with(".AppImage")) {
                     ui.label(RichText::new("AppImage · extracted native installation").size(11.0).color(self.palette.muted));
                 }
                 if web_only && self.release(app.id).is_some() {
@@ -652,9 +791,9 @@ impl Launcher {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.menu_button("···", |ui| self.app_menu(ui, app));
                     if installed.is_some() {
-                        if self.primary(ui, "Open", !self.worker.busy()) { self.command(Command::Launch(app.id.into())); }
+                        if self.primary(ui, "Open", true) { self.command(Command::Launch(app.id.into())); }
                     } else if compatible {
-                        if self.primary(ui, "Install", !self.worker.busy() && pending.is_none()) { self.command(Command::Install { id: app.id.into(), version: None }); }
+                        if self.primary(ui, "Install", pending.is_none()) { self.command(Command::Install { id: app.id.into(), version: None }); }
                     } else if web_only {
                         if widgets::button(ui, self.palette, "Open web ↗", ButtonKind::Secondary, true, 112.0).on_hover_text("This release has no compatible desktop package. Open ArtCraft's hosted web studio.").clicked() { self.external("https://app.getartcraft.com".into()); }
                     } else {
@@ -677,11 +816,14 @@ impl Launcher {
             ui.close();
         }
         if ui.button("View source ↗").clicked() {
-            self.external(format!("https://github.com/storytold/{}", app.id));
+            self.external(format!("https://github.com/storytold/{}", app.repository()));
             ui.close();
         }
         if ui.button("All releases ↗").clicked() {
-            self.external(format!("https://github.com/storytold/{}/releases", app.id));
+            self.external(format!(
+                "https://github.com/storytold/{}/releases",
+                app.repository()
+            ));
             ui.close();
         }
         ui.separator();
@@ -702,6 +844,30 @@ impl Launcher {
             ui.close();
         }
         if self.snapshot.state.installations.contains_key(app.id) {
+            if ui
+                .add_enabled(!self.worker.busy(), egui::Button::new("Check installation"))
+                .clicked()
+            {
+                self.command(Command::CheckInstallation(app.id.into()));
+                ui.close();
+            }
+            let managed = self
+                .snapshot
+                .state
+                .installations
+                .get(app.id)
+                .is_some_and(|install| install.managed);
+            if ui
+                .add_enabled(
+                    !self.worker.busy() && managed,
+                    egui::Button::new("Repair installation"),
+                )
+                .on_hover_text("Reinstall the same verified release and preserve your preferences.")
+                .clicked()
+            {
+                self.command(Command::Repair(app.id.into()));
+                ui.close();
+            }
             if ui
                 .add_enabled(!self.worker.busy(), egui::Button::new("Show app folder"))
                 .clicked()
@@ -758,18 +924,71 @@ impl Launcher {
         let Some(id) = self.detail.clone() else {
             return;
         };
-        let Ok(app) = craftlauncher_core::app(&id) else {
+        let Some(product) = self.snapshot.products.iter().find(|p| p.id == id).cloned() else {
             self.detail = None;
             return;
         };
+        let app = App::from(&product);
+        if self.entrypoint_app.as_deref() != Some(id.as_str()) {
+            let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+            self.entrypoint_draft = self
+                .preferences(&id)
+                .selected_entrypoints
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            self.entrypoint_app = Some(id.clone());
+        }
         let mut open = true;
         egui::Window::new(app.name).id(egui::Id::new("details")).open(&mut open).collapsible(false).resizable(false).default_width(660.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-130.0).max(300.0)).show(ui, |ui| {
                 if let Some(hero) = self.assets.hero(app.id) { ui.add(egui::Image::new(hero).fit_to_exact_size(Vec2::new(ui.available_width(), ui.available_width()*0.50)).corner_radius(4)); ui.add_space(12.0); }
                 ui.horizontal(|ui| { self.app_icon(ui, app.id, 54.0); ui.vertical(|ui| { ui.label(RichText::new(app.name).font(theme::display(34.0))); ui.label(RichText::new(app.category).color(self.palette.muted)); }); });
                 ui.add_space(10.0); ui.label(app.detail);
+                ui.label(RichText::new(format!("{} · Experimental software", app.stage)).color(self.palette.muted));
+                let release_status = match self.release(app.id) {
+                    _ if product.unavailable => "Repository unavailable · installed app remains usable".into(),
+                    Some(release) if self.available(app.id) => format!("{} available for {} / {}", release.tag_name, self.snapshot.platform, self.snapshot.arch),
+                    Some(release) => format!("{} published · no package for {} / {}", release.tag_name, self.snapshot.platform, self.snapshot.arch),
+                    None => "No published release loaded. Refresh releases to check availability.".into(),
+                };
+                ui.label(release_status);
+                self.project_controls(ui, Some(app.id));
                 ui.horizontal_wrapped(|ui| { for tag in app.tags { ui.label(RichText::new(format!(" {tag} ")).size(10.0).background_color(self.palette.sunken).color(self.palette.muted)); } });
                 ui.add_space(12.0); ui.separator();
+                if let Some(release) = self.release(app.id).cloned() {
+                    let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+                    let mut prefs = self.preferences(app.id);
+                    let selected = prefs.selected_assets.get(&key).cloned();
+                    let candidates = match resolve_asset(&release, &self.snapshot.platform, &self.snapshot.arch, None) {
+                        AssetResolution::Ambiguous(candidates) => candidates,
+                        _ => Vec::new(),
+                    };
+                    if !candidates.is_empty() {
+                        ui.label("Several compatible packages were found. Choose one:");
+                        let mut choice = selected.unwrap_or_default();
+                        egui::ComboBox::from_id_salt("package_choice")
+                            .selected_text(if choice.is_empty() { "Choose a package" } else { &choice })
+                            .show_ui(ui, |ui| { for candidate in &candidates { ui.selectable_value(&mut choice, candidate.name.clone(), &candidate.name); } });
+                        if !choice.is_empty() && prefs.selected_assets.get(&key) != Some(&choice) {
+                            prefs.selected_assets.insert(key, choice);
+                            self.command(Command::Preferences(app.id.into(), prefs));
+                        }
+                    }
+                }
+                ui.collapsing("Application entry in archive", |ui| {
+                    ui.label("Normally detected automatically. If installation lists multiple entries, enter the path shown in the error, relative to the extracted package.");
+                    ui.text_edit_singleline(&mut self.entrypoint_draft);
+                    let trimmed = self.entrypoint_draft.trim();
+                    let valid = trimmed.is_empty() || craftlauncher_core::installer::safe_native_relative(std::path::Path::new(trimmed));
+                    if !valid { ui.colored_label(self.palette.danger, "Enter a relative path inside the package."); }
+                    if ui.add_enabled(valid && !self.worker.busy(), egui::Button::new("Save application entry")).clicked() {
+                        let mut prefs = self.preferences(app.id);
+                        let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+                        if trimmed.is_empty() { prefs.selected_entrypoints.remove(&key); } else { prefs.selected_entrypoints.insert(key, trimmed.to_owned()); }
+                        self.command(Command::Preferences(app.id.into(), prefs));
+                    }
+                });
                 let mut preferences = self.preferences(app.id); let before = preferences.clone();
                 let mut changed = false;
                 ui.add_enabled_ui(!self.worker.busy(), |ui| {
@@ -789,16 +1008,28 @@ impl Launcher {
                 let versions = self.snapshot.state.releases.get(app.id).map(|r| r.versions.clone()).unwrap_or_default();
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("install_version").selected_text(if self.selected_version.is_empty() { "Choose a release" } else { &self.selected_version }).show_ui(ui, |ui| { for release in &versions { ui.selectable_value(&mut self.selected_version, release.tag_name.clone(), &release.tag_name); } });
-                    let can_install = !self.worker.busy() && !self.selected_version.is_empty() && versions.iter().find(|r| r.tag_name == self.selected_version).and_then(|r| asset_for(r, &self.snapshot.platform, &self.snapshot.arch)).is_some() && !self.snapshot.state.installations.get(app.id).is_some_and(|i| !i.managed) && !self.snapshot.state.pending.contains_key(app.id);
+                    let can_install = !product.unavailable && !self.selected_version.is_empty() && versions.iter().find(|r| r.tag_name == self.selected_version).is_some_and(|r| self.selected_asset(app.id, r).is_some_and(|asset| craftlauncher_core::platform::supports_managed(app.id, &self.snapshot.platform, asset) && !matches!(checksum_source(r, asset), ChecksumSource::Missing))) && !self.snapshot.state.installations.get(app.id).is_some_and(|i| !i.managed) && !self.snapshot.state.pending.contains_key(app.id);
                     if self.primary(ui, "Install version", can_install) { self.command(Command::Install { id: app.id.into(), version: Some(self.selected_version.clone()) }); }
                     if self.snapshot.state.installations.contains_key(app.id) && ui.add_enabled(!self.worker.busy(), egui::Button::new("Open app ↗")).clicked() { self.command(Command::Launch(app.id.into())); }
                 });
-                if !self.available(app.id) { ui.label(RichText::new(format!("No compatible published package for {} / {} is currently loaded.", self.snapshot.platform, self.snapshot.arch)).color(self.palette.muted)); }
+                if !self.available(app.id) {
+                    let prefs = self.preferences(app.id);
+                    let key = asset_preference_key(&self.snapshot.platform, &self.snapshot.arch);
+                    let reason = match self.release(app.id).map(|r| resolve_asset(r, &self.snapshot.platform, &self.snapshot.arch, prefs.selected_assets.get(&key).map(String::as_str))) {
+                        Some(AssetResolution::Ready(asset)) if !craftlauncher_core::platform::supports_managed(app.id, &self.snapshot.platform, asset) => "This installer format cannot be managed for this app; use its official release page.".to_owned(),
+                        Some(AssetResolution::Ready(asset)) if matches!(checksum_source(self.release(app.id).unwrap(), asset), ChecksumSource::Missing) => "This package has no SHA-256 checksum; installation is unavailable.".to_owned(),
+                        Some(AssetResolution::Ambiguous(_)) => "Choose a compatible package above.".to_owned(),
+                        Some(AssetResolution::NoCompatible) => format!("No supported package for {} / {}.", self.snapshot.platform, self.snapshot.arch),
+                        _ if product.unavailable => "The repository is unavailable.".to_owned(),
+                        _ => "No published release loaded. Refresh releases to check.".to_owned(),
+                    };
+                    ui.label(RichText::new(reason).color(self.palette.muted));
+                }
                 if let Some(error) = self.snapshot.state.releases.get(app.id).and_then(|r| r.error.as_ref()) { ui.label(RichText::new(error).color(self.palette.danger)); }
                 ui.collapsing("Release notes", |ui| { let notes = self.release(app.id).and_then(|r| r.body.clone()).unwrap_or_else(|| "No release notes loaded.".into()); ui.label(notes); });
                 ui.horizontal(|ui| {
-                    if ui.link("Source ↗").clicked() { self.external(format!("https://github.com/storytold/{}", app.id)); }
-                    if ui.link("Product website ↗").clicked() { self.external(if app.id == "artcraft" { "https://getartcraft.com".into() } else { format!("https://getartcraft.com/apps/{}", app.id) }); }
+                    if ui.link("Source ↗").clicked() { self.external(format!("https://github.com/storytold/{}", app.repository())); }
+                    if !product.discovered && ui.link("Product website ↗").clicked() { self.external(if app.id == "artcraft" { "https://getartcraft.com".into() } else { format!("https://getartcraft.com/apps/{}", app.executable_name()) }); }
                     if app.id == "artcraft" && ui.link("Open web studio ↗").clicked() { self.external("https://app.getartcraft.com".into()); }
                     if let Some(asset) = self.release(app.id).and_then(|r| r.assets.iter().find(|a| a.name.contains("-web-") && a.name.ends_with(".zip"))).cloned()
                         && ui.link("Download WebAssembly build ↗").clicked() { self.external(asset.browser_download_url); }
@@ -813,10 +1044,11 @@ impl Launcher {
         let Some(id) = self.confirm_remove.clone() else {
             return;
         };
-        let Ok(app) = craftlauncher_core::app(&id) else {
+        let Some(product) = self.snapshot.products.iter().find(|p| p.id == id).cloned() else {
             self.confirm_remove = None;
             return;
         };
+        let app = App::from(&product);
         let managed = self
             .snapshot
             .state
@@ -935,8 +1167,10 @@ impl Launcher {
                 .color(self.palette.muted),
         );
         ui.add_space(12.0);
-        let apps: Vec<App> = CATALOG
-            .into_iter()
+        let products = self.snapshot.products.clone();
+        let apps: Vec<App> = products
+            .iter()
+            .map(App::from)
             .filter(|app| {
                 self.snapshot.state.pending.contains_key(app.id)
                     || self
@@ -961,6 +1195,15 @@ impl Launcher {
                 )
                 .color(self.palette.muted),
             );
+        }
+        if ui
+            .add_enabled(
+                !craftlauncher_core::workspace::update_preview(&self.snapshot).is_empty(),
+                egui::Button::new("Update all…"),
+            )
+            .clicked()
+        {
+            self.review_updates();
         }
         for app in apps {
             Frame::new()
@@ -1030,7 +1273,7 @@ impl Launcher {
                                 if self.primary(
                                     ui,
                                     if pinned { "Pinned" } else { "Update" },
-                                    !self.worker.busy() && !pinned,
+                                    !pinned,
                                 ) {
                                     self.command(Command::Install {
                                         id: app.id.into(),
@@ -1095,6 +1338,7 @@ impl Launcher {
         ui.horizontal(|ui| {
             for (tab, label, width) in [
                 (SettingsTab::General, "General", 110.0),
+                (SettingsTab::Storage, "Storage", 110.0),
                 (SettingsTab::Changelog, "Changelog", 130.0),
                 (SettingsTab::About, "About & independence", 196.0),
             ] {
@@ -1118,6 +1362,10 @@ impl Launcher {
             }
             SettingsTab::About => {
                 self.settings_about(ui);
+                return;
+            }
+            SettingsTab::Storage => {
+                self.settings_storage(ui);
                 return;
             }
             SettingsTab::General => {}
@@ -1216,6 +1464,172 @@ impl Launcher {
         });
     }
 
+    fn settings_storage(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Managed storage").size(20.0).strong());
+        ui.label("Sizes exclude linked external apps and do not follow symbolic links.");
+        if ui
+            .add_enabled(!self.worker.busy(), egui::Button::new("Scan storage"))
+            .clicked()
+        {
+            self.command(Command::ScanStorage);
+        }
+        if let Some(report) = self.storage_report.clone() {
+            for app in report.apps {
+                let name = self
+                    .snapshot
+                    .products
+                    .iter()
+                    .find(|p| p.id == app.id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or(&app.id);
+                ui.group(|ui| {
+                    ui.label(RichText::new(name).strong());
+                    ui.label(format!(
+                        "Active {:.1} MB · rollback {:.1} MB · prepared update {:.1} MB",
+                        app.active_bytes as f64 / 1_000_000.0,
+                        app.rollback_bytes as f64 / 1_000_000.0,
+                        app.pending_bytes as f64 / 1_000_000.0
+                    ));
+                    if let Some(version) = app.rollback_version
+                        && ui
+                            .add_enabled(
+                                !self.worker.busy(),
+                                egui::Button::new(format!("Remove rollback {version}…")),
+                            )
+                            .clicked()
+                    {
+                        self.confirm_storage = Some((app.id.clone(), version, app.rollback_bytes));
+                    }
+                });
+            }
+            let bytes: u64 = report.downloads.iter().map(|file| file.bytes).sum();
+            ui.add_space(12.0);
+            ui.label(format!(
+                "Partial download cache: {} files · {:.1} MB",
+                report.downloads.len(),
+                bytes as f64 / 1_000_000.0
+            ));
+            ui.label("Downloads referenced by the queue are protected.");
+            for file in &report.downloads {
+                let mut selected = self.selected_cache.contains(&file.name);
+                let label = format!(
+                    "{} · {:.1} MB{}",
+                    file.name,
+                    file.bytes as f64 / 1_000_000.0,
+                    if file.protected { " · in queue" } else { "" }
+                );
+                if ui
+                    .add_enabled(
+                        !file.protected && !self.worker.busy(),
+                        egui::Checkbox::new(&mut selected, label),
+                    )
+                    .changed()
+                {
+                    if selected {
+                        self.selected_cache.insert(file.name.clone());
+                    } else {
+                        self.selected_cache.remove(&file.name);
+                    }
+                }
+            }
+            let count = self.selected_cache.len();
+            let selected_bytes: u64 = report
+                .downloads
+                .iter()
+                .filter(|file| self.selected_cache.contains(&file.name) && !file.protected)
+                .map(|file| file.bytes)
+                .sum();
+            if ui
+                .add_enabled(
+                    count > 0 && !self.worker.busy(),
+                    egui::Button::new(format!(
+                        "Remove {count} selected · {:.1} MB…",
+                        selected_bytes as f64 / 1_000_000.0
+                    )),
+                )
+                .clicked()
+            {
+                self.confirm_cache = true;
+            }
+            if self.confirm_cache {
+                let selected = report
+                    .downloads
+                    .iter()
+                    .filter(|file| self.selected_cache.contains(&file.name) && !file.protected)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                egui::Window::new("Remove cached downloads?")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ui.ctx(), |ui| {
+                        ui.label(format!(
+                            "Remove {} cached files ({:.1} MB)?",
+                            selected.len(),
+                            selected_bytes as f64 / 1_000_000.0
+                        ));
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for file in &selected {
+                                    ui.label(format!(
+                                        "{} · {:.1} MB",
+                                        file.name,
+                                        file.bytes as f64 / 1_000_000.0
+                                    ));
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                self.confirm_cache = false;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !selected.is_empty() && !self.worker.busy(),
+                                    egui::Button::new("Remove selected files"),
+                                )
+                                .clicked()
+                            {
+                                self.command(Command::RemoveCachedDownloads(
+                                    selected.iter().map(|file| file.name.clone()).collect(),
+                                ));
+                                self.confirm_cache = false;
+                            }
+                        });
+                    });
+            }
+        } else {
+            ui.label("Scan to see usage by app and the download cache.");
+        }
+        if let Some((id, version, bytes)) = self.confirm_storage.clone() {
+            egui::Window::new("Remove previous version?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Remove {id} {version} and free approximately {:.1} MB?",
+                        bytes as f64 / 1_000_000.0
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_storage = None;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.worker.busy(),
+                                egui::Button::new("Remove previous version"),
+                            )
+                            .clicked()
+                        {
+                            self.command(Command::RemoveRollback {
+                                id: id.clone(),
+                                version: version.clone(),
+                            });
+                            self.confirm_storage = None;
+                        }
+                    });
+                });
+        }
+    }
     fn settings_changelog(&self, ui: &mut Ui) {
         ui.label(
             RichText::new("WHAT'S NEW IN CRAFTLAUNCHER")

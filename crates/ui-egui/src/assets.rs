@@ -59,6 +59,97 @@ impl Assets {
                 result.heroes.insert(id, texture);
             }
         }
+        if let Some(texture) = load(
+            ctx,
+            "cadcraft",
+            include_bytes!("../../../assets/cadcraft.webp"),
+        ) {
+            result.icons.insert("cadcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "cadcraft-hero",
+            include_bytes!("../../../assets/cadcraft-hero.webp"),
+        ) {
+            result.heroes.insert("cadcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "deckcraft",
+            include_bytes!("../../../assets/deckcraft.webp"),
+        ) {
+            result.icons.insert("deckcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "deckcraft-hero",
+            include_bytes!("../../../assets/deckcraft-hero.webp"),
+        ) {
+            result.heroes.insert("deckcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "figcraft",
+            include_bytes!("../../../assets/figcraft.webp"),
+        ) {
+            result.icons.insert("figcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "gridcraft",
+            include_bytes!("../../../assets/gridcraft.webp"),
+        ) {
+            result.icons.insert("gridcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "gridcraft-hero",
+            include_bytes!("../../../assets/gridcraft-hero.webp"),
+        ) {
+            result.heroes.insert("gridcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "soundcraft",
+            include_bytes!("../../../assets/soundcraft.webp"),
+        ) {
+            result.icons.insert("soundcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "soundcraft-hero",
+            include_bytes!("../../../assets/soundcraft-hero.webp"),
+        ) {
+            result.heroes.insert("soundcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "wordcraft",
+            include_bytes!("../../../assets/wordcraft.webp"),
+        ) {
+            result.icons.insert("wordcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "wordcraft-hero",
+            include_bytes!("../../../assets/wordcraft-hero.webp"),
+        ) {
+            result.heroes.insert("wordcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "figcraft-hero",
+            include_bytes!("../../../assets/figcraft-hero.webp"),
+        ) {
+            result.heroes.insert("figcraft", texture);
+        }
+        if let Some(texture) = load(
+            ctx,
+            "artcraft",
+            include_bytes!("../../../assets/artcraft.webp"),
+        ) {
+            result.icons.insert("artcraft", texture);
+        }
         result
     }
     pub fn icon(&self, id: &str) -> Option<&TextureHandle> {

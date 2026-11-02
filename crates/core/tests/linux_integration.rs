@@ -52,6 +52,35 @@ fn native_bin_entry_forwards_arguments_updates_and_only_removes_its_owner() {
 }
 
 #[test]
+fn checks_shortcut_and_repairs_only_launcher_owned_entries() {
+    use craftlauncher_core::{
+        catalog::Product,
+        linux_integration::{check_product_in, register_product_in},
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let data = tmp.path().join("data");
+    let executable = tmp.path().join("app");
+    fs::write(&executable, b"app").unwrap();
+    let product = Product::from(craftlauncher_core::app("photocraft").unwrap());
+    assert!(!check_product_in(&bin, &data, &product, &executable).unwrap());
+    register_product_in(&bin, &data, &product, &executable).unwrap();
+    assert!(check_product_in(&bin, &data, &product, &executable).unwrap());
+    let desktop = data.join("applications/craftlauncher-photocraft.desktop");
+    let content = fs::read_to_string(&desktop).unwrap();
+    fs::write(&desktop, content.replace("Exec=", "Exec=modified ")).unwrap();
+    assert!(!check_product_in(&bin, &data, &product, &executable).unwrap());
+    register_product_in(&bin, &data, &product, &executable).unwrap();
+    assert!(check_product_in(&bin, &data, &product, &executable).unwrap());
+    fs::write(&desktop, b"[Desktop Entry]\nName=Foreign\n").unwrap();
+    assert!(register_product_in(&bin, &data, &product, &executable).is_err());
+    assert_eq!(
+        fs::read(&desktop).unwrap(),
+        b"[Desktop Entry]\nName=Foreign\n"
+    );
+}
+
+#[test]
 fn registration_cannot_overwrite_foreign_files_or_symlinks() {
     let fixture = tempfile::tempdir().unwrap();
     let home = fixture.path().join("home");
@@ -145,4 +174,37 @@ fn appimage_is_extracted_once_and_its_native_entry_runs_without_the_image() {
             .is_err()
     );
     assert!(!cancelled_stage.join("payload/squashfs-root").exists());
+}
+
+#[test]
+fn renamed_pdfcraft_tar_finds_the_new_executable_under_the_existing_launcher_id() {
+    use craftlauncher_core::platform::{PackageKind, Platform};
+    use std::sync::atomic::AtomicBool;
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("pdfcraft.tar.gz");
+    let file = fs::File::create(&archive).unwrap();
+    let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::default(),
+    ));
+    let contents = b"#!/bin/sh\nexit 0\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o755);
+    header.set_cksum();
+    tar.append_data(&mut header, "pdfcraft", &contents[..])
+        .unwrap();
+    tar.into_inner().unwrap().finish().unwrap();
+    let stage = tmp.path().join("stage");
+    let (entry, _) = craftlauncher_core::platform::Native
+        .unpack(
+            "printcraft",
+            PackageKind::TarGz,
+            &archive,
+            &stage,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(entry, std::path::PathBuf::from("payload/pdfcraft"));
+    assert!(stage.join(entry).is_file());
 }

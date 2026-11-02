@@ -1,13 +1,14 @@
 use crate::{
-    AppPreferences, CATALOG, Channel, Installation, PendingUpdate, Progress, Release, ReleaseCache,
-    Result, Settings, Snapshot, State, Version, fail,
+    AppPreferences, Channel, Installation, PendingUpdate, Progress, Release, ReleaseCache, Result,
+    Settings, Snapshot, State, Version, fail,
     installer::{safe_native_relative, safe_relative},
     model::{STATE_SCHEMA, is_newer, now},
     persistence::atomic_json,
     platform::{Native, Platform, package_kind},
-    releases::{Github, Remote, asset_for},
+    releases::{AssetResolution, Github, Remote, asset_preference_key, resolve_asset},
 };
 use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -16,11 +17,61 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[derive(Default)]
+struct TransferMeter {
+    last: Option<(f32, std::time::Instant)>,
+    bytes_per_second: Option<f64>,
+}
+impl TransferMeter {
+    fn sample(&mut self, percent: f32, total: u64) -> (u64, Option<f64>, Option<u64>) {
+        self.sample_at(percent, total, std::time::Instant::now())
+    }
+    fn sample_at(
+        &mut self,
+        percent: f32,
+        total: u64,
+        now: std::time::Instant,
+    ) -> (u64, Option<f64>, Option<u64>) {
+        let percent = percent.clamp(0.0, 100.0);
+        if let Some((previous, time)) = self.last {
+            let seconds = now.saturating_duration_since(time).as_secs_f64();
+            if percent < previous {
+                self.bytes_per_second = None;
+                self.last = Some((percent, now));
+            } else if seconds >= 0.25 && percent > previous {
+                let instantaneous =
+                    (f64::from(percent - previous) / 100.0) * total as f64 / seconds;
+                self.bytes_per_second = Some(
+                    self.bytes_per_second
+                        .map_or(instantaneous, |old| 0.7 * old + 0.3 * instantaneous),
+                );
+                self.last = Some((percent, now));
+            }
+        } else {
+            self.last = Some((percent, now));
+        }
+        let transferred = (f64::from(percent) / 100.0 * total as f64) as u64;
+        let remaining = self
+            .bytes_per_second
+            .filter(|speed| *speed > 0.0)
+            .map(|speed| ((total.saturating_sub(transferred) as f64 / speed).ceil()) as u64);
+        (transferred, self.bytes_per_second, remaining)
+    }
+}
+
+fn root_backup_path(root: &Path, schema: u32) -> PathBuf {
+    root.join(format!(
+        "state-before-schema-{schema}-{}.json",
+        uuid::Uuid::new_v4()
+    ))
+}
+
 pub struct Manager {
     pub root: PathBuf,
     pub state: State,
     remote: Box<dyn Remote>,
     platform: Box<dyn Platform>,
+    pub(crate) queue_owner: Option<String>,
     _lock: File,
 }
 impl Drop for Manager {
@@ -91,9 +142,27 @@ impl Manager {
             state,
             remote,
             platform,
+            queue_owner: None,
             _lock: lock,
         };
         manager.validate_state()?;
+        if manager.state.schema < STATE_SCHEMA {
+            // Keep an exact, separately named copy before persisting the migrated state.
+            let backup = root_backup_path(&manager.root, manager.state.schema);
+            let mut output = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&backup)?;
+            std::io::copy(&mut File::open(&state_path)?, &mut output)?;
+            output.sync_all()?;
+            for product in &mut manager.state.discovered_apps {
+                if product.app_id.is_empty() {
+                    product.app_id = product.repository.to_ascii_lowercase();
+                }
+            }
+            manager.state.schema = STATE_SCHEMA;
+            manager.save()?;
+        }
         manager.cleanup_staging()?;
         manager.reconcile_launcher_update()?;
         if let Some(message) = recovery {
@@ -104,7 +173,7 @@ impl Manager {
     }
     fn validate_state(&self) -> Result<()> {
         for (id, install) in &self.state.installations {
-            crate::app(id)?;
+            self.product(id)?;
             if install.managed {
                 self.managed_path(id, &install.executable)?;
                 if let Some(dir) = &install.directory {
@@ -140,7 +209,7 @@ impl Manager {
         Ok(())
     }
     pub fn managed_path(&self, id: &str, relative: &Path) -> Result<PathBuf> {
-        crate::app(id)?;
+        self.product(id)?;
         if !safe_native_relative(relative) {
             return Err(fail("Invalid managed installation path."));
         }
@@ -157,8 +226,8 @@ impl Manager {
         Ok(result)
     }
     fn cleanup_staging(&self) -> Result<()> {
-        for info in CATALOG {
-            let base = self.root.join("apps").join(info.id);
+        for info in crate::catalog::products(&self.state.discovered_apps) {
+            let base = self.root.join("apps").join(&info.id);
             if base
                 .symlink_metadata()
                 .is_ok_and(|m| m.file_type().is_symlink())
@@ -279,6 +348,7 @@ impl Manager {
             })
             .collect();
         Snapshot {
+            products: crate::catalog::products(&self.state.discovered_apps),
             state: self.state.clone(),
             root: self.root.clone(),
             platform: self.platform.os().into(),
@@ -308,6 +378,12 @@ impl Manager {
         );
         self.state.activity.truncate(60);
     }
+    pub fn product(&self, id: &str) -> Result<crate::catalog::Product> {
+        crate::catalog::products(&self.state.discovered_apps)
+            .into_iter()
+            .find(|product| product.id == id)
+            .ok_or_else(|| fail("Unknown app."))
+    }
     pub fn preferences(&self, id: &str) -> AppPreferences {
         self.state.preferences.get(id).cloned().unwrap_or_default()
     }
@@ -332,10 +408,103 @@ impl Manager {
             cache.release.as_ref()
         }
     }
+    pub fn asset_for_release<'a>(
+        &self,
+        id: &str,
+        release: &'a Release,
+    ) -> Option<&'a crate::Asset> {
+        let preferences = self.preferences(id);
+        let key = asset_preference_key(self.platform.os(), self.platform.arch());
+        resolve_asset(
+            release,
+            self.platform.os(),
+            self.platform.arch(),
+            preferences.selected_assets.get(&key).map(String::as_str),
+        )
+        .selected()
+    }
+    fn require_asset_for_release<'a>(
+        &self,
+        id: &str,
+        release: &'a Release,
+    ) -> Result<&'a crate::Asset> {
+        let preferences = self.preferences(id);
+        let key = asset_preference_key(self.platform.os(), self.platform.arch());
+        match resolve_asset(
+            release,
+            self.platform.os(),
+            self.platform.arch(),
+            preferences.selected_assets.get(&key).map(String::as_str),
+        ) {
+            AssetResolution::Ready(asset) => Ok(asset),
+            AssetResolution::Ambiguous(candidates) => Err(fail(format!(
+                "Choose a compatible package: {}",
+                candidates
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+            AssetResolution::NoCompatible => Err(fail(
+                "No compatible published package is available for this platform.",
+            )),
+        }
+    }
     pub fn compatible(&self, id: &str) -> bool {
         self.selected_release(id)
-            .and_then(|r| asset_for(r, self.platform.os(), self.platform.arch()))
-            .is_some()
+            .and_then(|r| self.asset_for_release(id, r))
+            .is_some_and(|asset| crate::platform::supports_managed(id, self.platform.os(), asset))
+    }
+    fn partial_path(
+        &self,
+        product: &crate::catalog::Product,
+        release: &Release,
+        asset: &crate::Asset,
+        checksum: &str,
+    ) -> Result<PathBuf> {
+        let directory = self.root.join("downloads");
+        fs::create_dir_all(&directory)?;
+        if directory.symlink_metadata()?.file_type().is_symlink()
+            || !fs::canonicalize(&directory)?.starts_with(&self.root)
+        {
+            return Err(fail("Unsafe download cache directory."));
+        }
+        let directory = if let Some(owner) = &self.queue_owner {
+            if !crate::queue::valid_id(owner) {
+                return Err(fail("Invalid queue task identifier."));
+            }
+            let owned = directory.join(owner);
+            fs::create_dir_all(&owned)?;
+            if owned.symlink_metadata()?.file_type().is_symlink()
+                || !fs::canonicalize(&owned)?.starts_with(&self.root)
+            {
+                return Err(fail("Unsafe task cache directory."));
+            }
+            owned
+        } else {
+            directory
+        };
+        let mut hash = Sha256::new();
+        for part in [
+            &product.id,
+            &product.repository,
+            &release.tag_name,
+            &asset.name,
+            &asset.browser_download_url,
+            &asset.size.to_string(),
+            &checksum.to_ascii_lowercase(),
+        ] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part.as_bytes());
+        }
+        let path = directory.join(format!("{:x}.part", hash.finalize()));
+        if path
+            .symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_file())
+        {
+            return Err(fail("Unsafe partial download file."));
+        }
+        Ok(path)
     }
     pub fn default_download_folder() -> Option<PathBuf> {
         directories::UserDirs::new().and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
@@ -353,7 +522,7 @@ impl Manager {
         }
         let ids: std::collections::BTreeSet<_> = ids.iter().collect();
         for id in &ids {
-            crate::app(id)?;
+            self.product(id)?;
         }
         fs::create_dir_all(folder)?;
         let folder = fs::canonicalize(folder)?;
@@ -372,15 +541,15 @@ impl Manager {
                 )));
             }
             let result = (|| {
+                let product = self.product(id)?;
+                if product.unavailable {
+                    return Err(fail("The product repository is unavailable."));
+                }
                 let release = self
                     .selected_release(id)
                     .cloned()
                     .ok_or_else(|| fail("Check for releases first."))?;
-                let asset = asset_for(&release, self.platform.os(), self.platform.arch())
-                    .cloned()
-                    .ok_or_else(|| {
-                        fail("No compatible published package is available for this platform.")
-                    })?;
+                let asset = self.require_asset_for_release(id, &release)?.clone();
                 if !safe_relative(Path::new(&asset.name))
                     || Path::new(&asset.name).components().count() != 1
                 {
@@ -390,8 +559,12 @@ impl Manager {
                     app_id: (*id).clone(),
                     phase: format!("Checking package {}/{}", index + 1, ids.len()),
                     percent: index as f32 * 100.0 / ids.len() as f32,
+                    transferred_bytes: None,
+                    total_bytes: None,
+                    bytes_per_second: None,
+                    seconds_remaining: None,
                 });
-                let checksum = self.remote.checksum(id, &asset, &release)?;
+                let checksum = self.remote.checksum_product(&product, &asset, &release)?;
                 let destination = folder.join(&asset.name);
                 if destination.symlink_metadata().is_ok() {
                     if destination.symlink_metadata()?.file_type().is_file()
@@ -403,29 +576,37 @@ impl Manager {
                         "A different file already exists at the destination. Choose another folder or rename it first.",
                     ));
                 }
-                let stage = tempfile::Builder::new()
-                    .prefix(".craftlauncher-download-")
-                    .tempdir_in(&folder)?;
-                let file = stage.path().join("payload.part");
-                let digest = self
-                    .remote
-                    .download(id, &asset, &file, cancel, &mut |percent| {
+                let file = self.partial_path(&product, &release, &asset, &checksum)?;
+                let mut meter = TransferMeter::default();
+                let digest = self.remote.download_product(
+                    &product,
+                    &asset,
+                    &file,
+                    cancel,
+                    &mut |percent| {
+                        let (transferred, speed, remaining) = meter.sample(percent, asset.size);
                         progress(Progress {
                             app_id: (*id).clone(),
                             phase: format!("Downloading {}/{}", index + 1, ids.len()),
                             percent: (index as f32 * 100.0 + percent) / ids.len() as f32,
+                            transferred_bytes: Some(transferred),
+                            total_bytes: Some(asset.size),
+                            bytes_per_second: speed,
+                            seconds_remaining: remaining,
                         })
-                    })?;
+                    },
+                )?;
                 if cancel.load(Ordering::Relaxed) {
                     return Err(fail("Download cancelled."));
                 }
                 if digest != checksum || file.metadata()?.len() != asset.size {
+                    let _ = fs::remove_file(&file);
                     return Err(fail(
                         "Checksum or byte count mismatch. The download was discarded.",
                     ));
                 }
                 let mut output = tempfile::NamedTempFile::new_in(&folder)?;
-                std::io::copy(&mut File::open(file)?, output.as_file_mut())?;
+                std::io::copy(&mut File::open(&file)?, output.as_file_mut())?;
                 output.as_file().sync_all()?;
                 output.persist_noclobber(&destination).map_err(|e| {
                     fail(format!(
@@ -433,6 +614,7 @@ impl Manager {
                         e.error
                     ))
                 })?;
+                fs::remove_file(&file)?;
                 Ok(asset.name)
             })();
             match result {
@@ -447,7 +629,7 @@ impl Manager {
                 }
                 Err(error) => {
                     self.record(Some(id), "package download", error.to_string(), true);
-                    errors.push(format!("{}: {error}", crate::app(id)?.name));
+                    errors.push(format!("{}: {error}", self.product(id)?.name));
                 }
             }
             self.save()?;
@@ -468,11 +650,14 @@ impl Manager {
         }
     }
     pub fn refresh_app(&mut self, id: &str) -> Result<()> {
-        crate::app(id)?;
+        let product = self.product(id)?;
+        if product.unavailable {
+            return Err(fail("The product repository is unavailable."));
+        }
         let channel = self.channel(id);
         match self
             .remote
-            .release(id, channel, self.state.releases.get(id))
+            .release_product(&product, channel, self.state.releases.get(id))
         {
             Ok(cache) => {
                 self.state.releases.insert(id.into(), cache);
@@ -505,14 +690,35 @@ impl Manager {
         cancel: &AtomicBool,
         changed: &mut dyn FnMut(Snapshot),
     ) -> Result<()> {
-        for info in CATALOG {
+        let mut errors = Vec::new();
+        for info in crate::catalog::products(&self.state.discovered_apps) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(fail("Release check cancelled."));
             }
-            let _ = self.refresh_app(info.id);
-            changed(self.snapshot());
+            if !info.unavailable {
+                if let Err(error) = self.refresh_app(&info.id) {
+                    let message = error.to_string();
+                    let rate_limited = message.contains("GitHub rate limit reached");
+                    errors.push(format!("{}: {message}", info.name));
+                    changed(self.snapshot());
+                    if rate_limited {
+                        break;
+                    }
+                } else {
+                    changed(self.snapshot());
+                }
+            }
         }
-        self.save()
+        self.save()?;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(fail(format!(
+                "{} release checks failed: {}",
+                errors.len(),
+                errors.into_iter().take(5).collect::<Vec<_>>().join(" · ")
+            )))
+        }
     }
     pub fn configure(&mut self, settings: Settings, launcher: &Path) -> Result<()> {
         let before = self.state.settings.clone();
@@ -531,7 +737,7 @@ impl Manager {
         Ok(())
     }
     pub fn set_preferences(&mut self, id: &str, preferences: AppPreferences) -> Result<()> {
-        crate::app(id)?;
+        self.product(id)?;
         let before = self.state.clone();
         self.state.preferences.insert(id.into(), preferences);
         let pending = if self.state.preferences[id].channel
@@ -571,7 +777,7 @@ impl Manager {
         }
     }
     pub fn link(&mut self, id: &str, executable: PathBuf) -> Result<()> {
-        let info = crate::app(id)?;
+        let info = self.product(id)?;
         if self.state.installations.get(id).is_some_and(|i| i.managed) {
             return Err(fail(
                 "Uninstall the managed app before linking an external installation.",
@@ -623,25 +829,217 @@ impl Manager {
         Ok(())
     }
     pub fn launch(&mut self, id: &str) -> Result<Option<u32>> {
-        crate::app(id)?;
+        self.product(id)?;
         let install = self
             .state
             .installations
             .get(id)
             .ok_or_else(|| fail("Install or link this app first."))?;
         let executable = self.executable(id, install)?;
-        let pid = self.platform.launch(&executable)?;
+        let log_dir = self.root.join("logs");
+        fs::create_dir_all(&log_dir)?;
+        if log_dir.symlink_metadata()?.file_type().is_symlink()
+            || !fs::canonicalize(&log_dir)?.starts_with(&self.root)
+        {
+            return Err(fail("Unsafe app log directory."));
+        }
+        let log = log_dir.join(format!("{id}.log"));
+        let pid = match self.platform.launch_with_log(&executable, &log) {
+            Ok(pid) => pid,
+            Err(error) => {
+                self.record(Some(id), "launch", error.to_string(), true);
+                self.save()?;
+                return Err(error);
+            }
+        };
         if let Some(install) = self.state.installations.get_mut(id) {
             install.last_opened_at = Some(now());
         }
         self.record(
             Some(id),
             "launch",
-            format!("{} launched.", crate::app(id)?.name),
+            format!("{} launched.", self.product(id)?.name),
             false,
         );
         self.save()?;
         Ok(pid)
+    }
+    pub fn open_project(&mut self, id: &str, path: PathBuf) -> Result<()> {
+        self.product(id)?;
+        let path = fs::canonicalize(path)?;
+        if !path.is_file() {
+            return Err(fail("Select a project file."));
+        }
+        let install = self
+            .state
+            .installations
+            .get(id)
+            .ok_or_else(|| fail("Install or link this app first."))?;
+        let executable = self.executable(id, install)?;
+        self.platform.open_project(&executable, &path)?;
+        self.state
+            .recent_projects
+            .retain(|p| p.path != path || p.app_id != id);
+        self.state.recent_projects.insert(
+            0,
+            crate::workspace::RecentProject {
+                path,
+                app_id: id.into(),
+                opened_at: now(),
+            },
+        );
+        self.state.recent_projects.truncate(30);
+        if let Some(install) = self.state.installations.get_mut(id) {
+            install.last_opened_at = Some(now());
+        }
+        self.record(Some(id), "open project", "Project opened.", false);
+        self.save()
+    }
+    pub fn discover_products(&mut self, cancel: &AtomicBool) -> Result<()> {
+        match self
+            .remote
+            .discover_cached(cancel, &self.state.discovery_pages)
+        {
+            Ok((apps, pages)) => {
+                self.state.discovery_pages = pages;
+                // Preserve cached candidates that disappear from GitHub. Match by stable
+                // repository ID first, with a name fallback for pre-ID state files.
+                let mut merged = self.state.discovered_apps.clone();
+                for old in &mut merged {
+                    if old.app_id.is_empty() {
+                        old.app_id = old.repository.to_ascii_lowercase();
+                    }
+                    old.unavailable = true;
+                }
+                for mut incoming in apps {
+                    incoming.unavailable = false;
+                    let existing = merged.iter_mut().find(|old| {
+                        (incoming.github_id.is_some() && incoming.github_id == old.github_id)
+                            || (old.github_id.is_none()
+                                && old.repository.eq_ignore_ascii_case(&incoming.repository))
+                    });
+                    if let Some(old) = existing {
+                        incoming.app_id = old.app_id.clone();
+                        *old = incoming;
+                    } else {
+                        merged.push(incoming);
+                    }
+                }
+                merged.sort_by_key(|app| app.repository.to_ascii_lowercase());
+                self.state.discovered_apps = merged;
+                self.state.discovery_checked_at = Some(now());
+                self.state.discovery_error = None;
+            }
+            Err(error) => {
+                self.state.discovery_error = Some(error.to_string());
+            }
+        }
+        self.save()
+    }
+    pub fn update_reviewed(
+        &mut self,
+        id: &str,
+        version: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<()> {
+        crate::workspace::update_preview(&self.snapshot())
+            .into_iter()
+            .find(|p| p.app_id == id && p.next == version && !p.pinned)
+            .ok_or_else(|| fail("This update is no longer eligible. Review updates again."))?;
+        self.stage_install(id, None, cancel, progress)
+    }
+    pub fn check_installation(&self, id: &str) -> Result<String> {
+        let install = self
+            .state
+            .installations
+            .get(id)
+            .ok_or_else(|| fail("This app is not installed."))?;
+        let executable = self.executable(id, install)?;
+        if !executable.exists() {
+            return Err(fail("The app executable is missing."));
+        }
+        if !install.managed {
+            return Ok("Linked app exists; its files are externally managed.".into());
+        }
+        let directory = install
+            .directory
+            .as_ref()
+            .ok_or_else(|| fail("The app installation directory is missing."))?;
+        let path = self.managed_path(id, directory)?;
+        if self
+            .platform
+            .check_shortcut_product(&self.product(id)?, &executable)?
+            == Some(false)
+        {
+            return Err(fail(
+                "The application shortcut is missing or changed. Repair the installation.",
+            ));
+        }
+        match crate::inventory::verify(&path)? {
+            None => Ok("App exists; this older installation has no file inventory. Reinstall to enable full verification.".into()),
+            Some(files) if files.is_empty() => Ok("Managed application files verified.".into()),
+            Some(files) => Err(fail(format!("{} application files are missing or changed: {}", files.len(), files.iter().take(5).map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")))),
+        }
+    }
+    pub fn repair(
+        &mut self,
+        id: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<()> {
+        let install = self
+            .state
+            .installations
+            .get(id)
+            .ok_or_else(|| fail("This app is not installed."))?;
+        if !install.managed {
+            return Err(fail(
+                "This app is externally managed. Relink its executable instead.",
+            ));
+        }
+        let version = install.version.clone();
+        let executable = self.executable(id, install)?;
+        if executable.exists()
+            && let Some(directory) = &install.directory
+        {
+            let path = self.managed_path(id, directory)?;
+            if matches!(crate::inventory::verify(&path)?, Some(files) if files.is_empty())
+                && self
+                    .platform
+                    .check_shortcut_product(&self.product(id)?, &executable)?
+                    == Some(false)
+            {
+                self.platform
+                    .shortcut_product(&self.product(id)?, &executable)?;
+                self.record(Some(id), "repair", "Application shortcut restored.", false);
+                self.save()?;
+                return Ok(());
+            }
+        }
+        self.refresh_app(id)?;
+        if !self.state.releases.get(id).is_some_and(|cache| {
+            cache.versions.iter().any(|r| r.tag_name == version)
+                || cache
+                    .release
+                    .as_ref()
+                    .is_some_and(|r| r.tag_name == version)
+        }) {
+            return Err(fail(
+                "The installed version is no longer available upstream. Choose a newer version explicitly.",
+            ));
+        }
+        self.stage_install_for(id, Some(&version), cancel, progress, false, false)
+    }
+    pub fn stage_queued_install(
+        &mut self,
+        id: &str,
+        version: &str,
+        pin_requested: bool,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<()> {
+        self.stage_install_for(id, Some(version), cancel, progress, false, pin_requested)
     }
     pub fn stage_install(
         &mut self,
@@ -650,7 +1048,7 @@ impl Manager {
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<()> {
-        self.stage_install_for(id, requested_version, cancel, progress, false)
+        self.stage_install_for(id, requested_version, cancel, progress, false, true)
     }
     fn stage_install_for(
         &mut self,
@@ -659,8 +1057,12 @@ impl Manager {
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(Progress),
         automatic: bool,
+        pin_requested: bool,
     ) -> Result<()> {
-        let info = crate::app(id)?;
+        let info = self.product(id)?;
+        if info.unavailable {
+            return Err(fail("The product repository is unavailable."));
+        }
         if self.state.installations.get(id).is_some_and(|i| !i.managed) {
             return Err(fail(
                 "This app is externally managed. Unlink it before installing a managed version.",
@@ -693,12 +1095,13 @@ impl Manager {
                 "Switch to the Preview channel to install a prerelease.",
             ));
         }
-        let asset = asset_for(&release, self.platform.os(), self.platform.arch())
-            .cloned()
-            .ok_or_else(|| {
-                fail("No compatible published package is available for this platform.")
-            })?;
+        let asset = self.require_asset_for_release(id, &release)?.clone();
         let kind = package_kind(&asset)?;
+        if !crate::platform::supports_managed(id, self.platform.os(), &asset) {
+            return Err(fail(
+                "This package format is not supported for managed installation. Use the official release page.",
+            ));
+        }
         let token = uuid::Uuid::new_v4().to_string();
         let base = self.root.join("apps").join(id);
         fs::create_dir_all(&base)?;
@@ -713,32 +1116,55 @@ impl Manager {
                 app_id: id.into(),
                 phase: "Checking checksum".into(),
                 percent: 0.0,
+                transferred_bytes: None,
+                total_bytes: None,
+                bytes_per_second: None,
+                seconds_remaining: None,
             });
-            let checksum = self.remote.checksum(id, &asset, &release)?;
+            let checksum = self.remote.checksum_product(&info, &asset, &release)?;
             if cancel.load(Ordering::Relaxed) {
                 return Err(fail("Download cancelled."));
             }
-            let archive = stage.join("download");
-            let digest = self
-                .remote
-                .download(id, &asset, &archive, cancel, &mut |percent| {
-                    progress(Progress {
-                        app_id: id.into(),
-                        phase: "Downloading".into(),
-                        percent,
-                    })
-                })?;
-            if digest != checksum {
+            let archive = self.partial_path(&info, &release, &asset, &checksum)?;
+            let mut meter = TransferMeter::default();
+            let digest =
+                self.remote
+                    .download_product(&info, &asset, &archive, cancel, &mut |percent| {
+                        let (transferred, speed, remaining) = meter.sample(percent, asset.size);
+                        progress(Progress {
+                            app_id: id.into(),
+                            phase: "Downloading".into(),
+                            percent,
+                            transferred_bytes: Some(transferred),
+                            total_bytes: Some(asset.size),
+                            bytes_per_second: speed,
+                            seconds_remaining: remaining,
+                        })
+                    })?;
+            if digest != checksum || archive.metadata()?.len() != asset.size {
+                let _ = fs::remove_file(&archive);
                 return Err(fail("Checksum mismatch. The download was discarded."));
             }
             progress(Progress {
                 app_id: id.into(),
                 phase: "Extracting".into(),
                 percent: 100.0,
+                transferred_bytes: None,
+                total_bytes: None,
+                bytes_per_second: None,
+                seconds_remaining: None,
             });
-            let (executable, installer) =
-                self.platform.unpack(id, kind, &archive, &stage, cancel)?;
+            let preferences = self.preferences(id);
+            let key = asset_preference_key(self.platform.os(), self.platform.arch());
+            let entrypoint = preferences
+                .selected_entrypoints
+                .get(&key)
+                .map(String::as_str);
+            let (executable, installer) = self.platform.unpack_product_with_entrypoint(
+                &info, kind, &archive, &stage, cancel, entrypoint,
+            )?;
             fs::remove_file(archive)?;
+            crate::inventory::create(&stage)?;
             if cancel.load(Ordering::Relaxed) {
                 return Err(fail("Download cancelled."));
             }
@@ -758,7 +1184,7 @@ impl Manager {
             };
             self.validate_version(id, &version)?;
             let before = self.state.clone();
-            if requested_version.is_some() {
+            if pin_requested && requested_version.is_some() {
                 self.state
                     .preferences
                     .entry(id.into())
@@ -807,7 +1233,7 @@ impl Manager {
         Ok(())
     }
     pub fn activate_pending(&mut self, id: &str) -> Result<bool> {
-        crate::app(id)?;
+        self.product(id)?;
         let Some(pending) = self.state.pending.get(id).cloned() else {
             return Ok(false);
         };
@@ -827,6 +1253,9 @@ impl Manager {
         }
         if !executable.exists() {
             return Err(fail("The staged app executable is missing."));
+        }
+        if pending.version.installer.is_some() {
+            crate::inventory::create(&self.managed_path(id, &pending.version.directory)?)?;
         }
         let before = self.state.clone();
         let old = self.state.installations.get(id).cloned();
@@ -859,7 +1288,7 @@ impl Manager {
             if old.is_some() { "update" } else { "install" },
             format!(
                 "{} {} {}.",
-                crate::app(id)?.name,
+                self.product(id)?.name,
                 pending.version.version,
                 if old.is_some() {
                     "updated"
@@ -873,7 +1302,10 @@ impl Manager {
             self.state = before;
             return Err(e);
         }
-        if let Err(e) = self.platform.shortcut(id, &executable) {
+        if let Err(e) = self
+            .platform
+            .shortcut_product(&self.product(id)?, &executable)
+        {
             self.record(Some(id), "shortcut", e.to_string(), true);
             self.save()?;
             return Err(fail(format!(
@@ -888,7 +1320,7 @@ impl Manager {
         if self.state.settings.notifications {
             crate::platform::notify(&format!(
                 "{} {} is ready.",
-                crate::app(id)?.name,
+                self.product(id)?.name,
                 pending.version.version
             ));
         }
@@ -904,7 +1336,7 @@ impl Manager {
         self.save()
     }
     pub fn discard_pending(&mut self, id: &str) -> Result<()> {
-        crate::app(id)?;
+        self.product(id)?;
         if let Some(pending) = self.state.pending.remove(id) {
             if let Err(e) = self.save() {
                 self.state.pending.insert(id.into(), pending);
@@ -939,6 +1371,9 @@ impl Manager {
         }
         if !executable.exists() {
             return Err(fail("The previous version is missing."));
+        }
+        if previous.installer.is_some() {
+            crate::inventory::create(&self.managed_path(id, &previous.directory)?)?;
         }
         let before = self.state.clone();
         let directory = installed
@@ -975,7 +1410,7 @@ impl Manager {
             "rollback",
             format!(
                 "{} switched to {} and pinned.",
-                crate::app(id)?.name,
+                self.product(id)?.name,
                 previous.version
             ),
             false,
@@ -984,7 +1419,8 @@ impl Manager {
             self.state = before;
             return Err(e);
         }
-        self.platform.shortcut(id, &executable)?;
+        self.platform
+            .shortcut_product(&self.product(id)?, &executable)?;
         Ok(())
     }
     pub fn remove(&mut self, id: &str) -> Result<()> {
@@ -1018,7 +1454,7 @@ impl Manager {
             "remove",
             format!(
                 "{} {}. Project files were kept.",
-                crate::app(id)?.name,
+                self.product(id)?.name,
                 if installed.managed {
                     "uninstalled"
                 } else {
@@ -1036,7 +1472,8 @@ impl Manager {
         }
         if moved {
             fs::remove_dir_all(trash)?;
-            self.platform.remove_shortcut_for(id, &executable)?;
+            self.platform
+                .remove_shortcut_product(&self.product(id)?, &executable)?;
         }
         Ok(())
     }
@@ -1049,35 +1486,210 @@ impl Manager {
         if !self.state.settings.auto_app_update {
             return Ok(());
         }
-        for info in CATALOG {
+        for product in crate::catalog::products(&self.state.discovered_apps) {
+            let info = product.id.as_str();
+            if product.unavailable {
+                continue;
+            }
             if cancel.load(Ordering::Relaxed) {
                 return Err(fail("Update check cancelled."));
             }
-            let preference = self.preferences(info.id);
+            let preference = self.preferences(info);
             if !preference.auto_update
                 || preference.pinned_version.is_some()
-                || self.state.pending.contains_key(info.id)
+                || self.state.pending.contains_key(info)
             {
                 continue;
             }
-            let should_update = self
-                .state
-                .installations
-                .get(info.id)
-                .is_some_and(|installed| {
-                    installed.managed
-                        && self
-                            .selected_release(info.id)
-                            .is_some_and(|release| is_newer(&release.tag_name, &installed.version))
-                });
-            if should_update && self.compatible(info.id) {
-                if let Err(e) = self.stage_install_for(info.id, None, cancel, progress, true) {
-                    self.record(Some(info.id), "auto update", e.to_string(), true);
+            let should_update = self.state.installations.get(info).is_some_and(|installed| {
+                installed.managed
+                    && self
+                        .selected_release(info)
+                        .is_some_and(|release| is_newer(&release.tag_name, &installed.version))
+            });
+            if should_update && self.compatible(info) {
+                if let Err(e) = self.stage_install_for(info, None, cancel, progress, true, false) {
+                    self.record(Some(info), "auto update", e.to_string(), true);
                 }
                 changed(self.snapshot());
             }
         }
         self.activate_all_pending()
+    }
+    pub fn storage_report(&self) -> Result<crate::storage::StorageReport> {
+        let mut report = crate::storage::StorageReport::default();
+        for (id, install) in &self.state.installations {
+            if !install.managed {
+                continue;
+            }
+            let measure = |path: &Path| -> Result<u64> {
+                crate::storage::directory_size(&self.managed_path(id, path)?)
+            };
+            let active_bytes = install
+                .directory
+                .as_deref()
+                .map(measure)
+                .transpose()?
+                .unwrap_or(0);
+            let rollback_bytes = install
+                .previous
+                .as_ref()
+                .map(|v| measure(&v.directory))
+                .transpose()?
+                .unwrap_or(0);
+            let pending_bytes = self
+                .state
+                .pending
+                .get(id)
+                .map(|v| measure(&v.version.directory))
+                .transpose()?
+                .unwrap_or(0);
+            report.apps.push(crate::storage::AppStorage {
+                id: id.clone(),
+                active_bytes,
+                rollback_bytes,
+                pending_bytes,
+                rollback_version: install.previous.as_ref().map(|v| v.version.clone()),
+            });
+        }
+        // An installation can be staged before its first activation.
+        for (id, pending) in &self.state.pending {
+            if !self.state.installations.contains_key(id) {
+                report.apps.push(crate::storage::AppStorage {
+                    id: id.clone(),
+                    active_bytes: 0,
+                    rollback_bytes: 0,
+                    pending_bytes: crate::storage::directory_size(
+                        &self.managed_path(id, &pending.version.directory)?,
+                    )?,
+                    rollback_version: None,
+                });
+            }
+        }
+        let queue = crate::queue::load(&self.root)?;
+        report.downloads = crate::storage::downloads(&self.root)?;
+        for item in &mut report.downloads {
+            item.protected = item
+                .name
+                .split_once('/')
+                .is_some_and(|(owner, _)| queue.iter().any(|task| task.id == owner));
+        }
+        Ok(report)
+    }
+    pub fn remove_cached_downloads(&self, names: &[String]) -> Result<usize> {
+        let report = self.storage_report()?;
+        let cache = self.root.join("downloads");
+        if cache
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Err(fail("Unsafe download cache directory."));
+        }
+        let mut targets = Vec::new();
+        for name in names {
+            let item = report
+                .downloads
+                .iter()
+                .find(|item| item.name == *name)
+                .ok_or_else(|| fail("A cache entry changed; scan storage again."))?;
+            if item.protected {
+                return Err(fail("A selected download is referenced by the queue."));
+            }
+            let parts: Vec<&str> = name.split('/').collect();
+            let valid = match parts.as_slice() {
+                [file] => crate::storage::is_cache_name(file),
+                [owner, file] => {
+                    crate::queue::valid_id(owner) && crate::storage::is_cache_name(file)
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(fail("Invalid cache entry."));
+            }
+            let path = cache.join(name);
+            if let Some(parent) = path.parent()
+                && parent
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                return Err(fail("Unsafe cache path."));
+            }
+            if !path.symlink_metadata()?.file_type().is_file() {
+                return Err(fail("Unsafe cache file."));
+            }
+            targets.push(path);
+        }
+        targets.sort();
+        targets.dedup();
+        for path in &targets {
+            fs::remove_file(path)?;
+        }
+        for path in &targets {
+            if let Some(parent) = path.parent()
+                && parent != cache
+            {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+        Ok(targets.len())
+    }
+    pub fn remove_rollback(&mut self, id: &str, expected_version: &str) -> Result<()> {
+        let install = self
+            .state
+            .installations
+            .get(id)
+            .ok_or_else(|| fail("This app is not installed."))?;
+        let previous = install
+            .previous
+            .clone()
+            .ok_or_else(|| fail("No rollback version is available."))?;
+        if previous.version != expected_version {
+            return Err(fail("The rollback version changed; review storage again."));
+        }
+        self.validate_version(id, &previous)?;
+        if install.directory.as_ref() == Some(&previous.directory)
+            || self
+                .state
+                .pending
+                .get(id)
+                .is_some_and(|p| p.version.directory == previous.directory)
+        {
+            return Err(fail("The version is still in use."));
+        }
+        let path = self.managed_path(id, &previous.directory)?;
+        let base = self.root.join("apps").join(id);
+        let mut checked = self.root.clone();
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| fail("Unsafe rollback path."))?;
+        for component in relative.components() {
+            checked.push(component);
+            if checked
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                return Err(fail("Rollback path contains a symbolic link."));
+            }
+        }
+        if !path.starts_with(base.join("versions")) {
+            return Err(fail("Unsafe rollback path."));
+        }
+        if path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Err(fail("Rollback directory is a symbolic link."));
+        }
+        let before = self.state.clone();
+        self.state.installations.get_mut(id).unwrap().previous = None;
+        if let Err(e) = self.save() {
+            self.state = before;
+            return Err(e);
+        }
+        if path.exists() {
+            fs::remove_dir_all(path)?;
+        }
+        Ok(())
     }
     pub fn running_apps(&self) -> BTreeMap<String, bool> {
         self.snapshot().running
@@ -1096,5 +1708,32 @@ impl Manager {
         };
         open::that(path).map_err(|e| fail(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod transfer_meter_tests {
+    use super::TransferMeter;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn rate_ignores_bytes_received_before_resume_and_smooths_later_samples() {
+        let mut meter = TransferMeter::default();
+        let start = Instant::now();
+        assert_eq!(
+            meter.sample_at(50.0, 1_000_000, start),
+            (500_000, None, None)
+        );
+        let (bytes, speed, eta) = meter.sample_at(60.0, 1_000_000, start + Duration::from_secs(1));
+        assert_eq!(bytes, 600_000);
+        assert_eq!(speed, Some(100_000.0));
+        assert_eq!(eta, Some(4));
+        let (_, speed, _) = meter.sample_at(80.0, 1_000_000, start + Duration::from_secs(2));
+        assert_eq!(speed, Some(130_000.0));
+        assert_eq!(
+            meter
+                .sample_at(0.0, 1_000_000, start + Duration::from_secs(3))
+                .1,
+            None
+        );
     }
 }

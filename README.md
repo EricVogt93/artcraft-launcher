@@ -10,7 +10,7 @@ Your creative tools, ready to launch.
 
 ![CI](https://github.com/EricVogt93/artcraft-launcher/actions/workflows/ci.yml/badge.svg?branch=main)
 
-A native Rust toolbox for the [ArtCraft family](https://github.com/storytold). Install, launch, update and manage ArtCraft, PhotoCraft, VectorCraft, FilmCraft, LightCraft, PrintCraft, EffectCraft and DesignCraft in one desktop app.
+A native Rust toolbox for the [ArtCraft family](https://github.com/storytold). Install, launch, update and manage ArtCraft and other Craft apps in one desktop app. New public Craft repositories from the official account are discovered automatically.
 
 **Independent project by Eric Vogt.** I develop only CraftLauncher. I am not affiliated with, employed by, sponsored by or endorsed by ArtCraft, Storytold or any of the applications this launcher manages. Their developers are solely responsible for their applications, licenses, updates and support. Please report launcher issues here and application issues to the respective upstream project.
 
@@ -120,3 +120,17 @@ The native smoke test runs in the existing desktop session. For headless Linux/F
 Source code is [Apache-2.0](LICENSE), preserving this repository’s original license. See [NOTICE](NOTICE). Bundled typefaces retain their SIL OFL licenses; product icons and screenshots identify their respective upstream apps. See [asset attribution](assets/ATTRIBUTION.md).
 
 Eric Vogt develops only CraftLauncher and is not affiliated with ArtCraft, Storytold or any of the applications it manages. Those applications are developed and supported independently by their respective owners. The repository presentation is inspired by [ArtCraft](https://github.com/storytold/artcraft). The original launcher [logo](assets/craftlauncher-logo.png) and its generation prompt are documented in [branding](assets/BRANDING.md).
+
+The launcher keeps `printcraft` as the local ID for PdfCraft to preserve existing installations and settings. Downloads use the official `storytold/pdfcraft` repository. AniCraft currently has no published releases; it can be linked to a local build.
+
+### Workspace workflows
+
+- **Updates → Update all…** previews installed and available versions and total download size. Choose individual updates; pinned apps stay excluded. Verified updates wait for running apps to close.
+- **Queue** runs installations and package downloads sequentially, with progress, estimated speed, pause, cancellation and retry. Unfinished work returns paused after restart; compatible servers can resume partial downloads. Project and app launches are not replayed.
+- **Open project file…**, or drop one or more files onto the launcher, to choose an installed Craft app. Suggestions follow the file extension; actual format support depends on the app version. Recent projects are saved locally and can be cleared.
+- **Discover** scans PATH and common application folders at startup or on demand. Review a detected executable before linking it. Managed launcher wrappers are excluded.
+- Product discovery checks public, active, non-fork `*craft` repositories under `storytold` during release refreshes, normally every six hours while the launcher is running. New products appear in **All apps** and can be installed when a verified compatible package exists. Offline checks preserve previous results; missing repositories remain visible with a status notice.
+- Product details show release and OS/CPU availability. When packages or archive entries are ambiguous, select the intended one before retrying. Curated artwork is shown where bundled; new products use a placeholder.
+- **Ctrl+K** (or **⌘+K** on macOS) opens quick actions for installed apps, recent projects, navigation and refresh.
+- **Settings → Storage** shows managed versions and cached downloads, and protects queue-referenced downloads during cleanup. Managed installations can be checked or repaired from the app menu.
+- Early observable launch failures appear in the queue. For supported native process launches, a bounded local output log and a copyable diagnostic report are available; paths under the home directory are redacted in the copied report.

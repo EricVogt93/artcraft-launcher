@@ -15,10 +15,10 @@ pub enum PackageKind {
     Nsis,
 }
 pub fn package_kind(asset: &Asset) -> Result<PackageKind> {
-    let name = &asset.name;
+    let name = asset.name.to_ascii_lowercase();
     if name.ends_with(".tar.gz") {
         Ok(PackageKind::TarGz)
-    } else if name.ends_with(".AppImage") {
+    } else if name.ends_with(".appimage") {
         Ok(PackageKind::AppImage)
     } else if name.ends_with(".zip") {
         Ok(PackageKind::Zip)
@@ -31,11 +31,31 @@ pub fn package_kind(asset: &Asset) -> Result<PackageKind> {
     }
 }
 
+/// Only installers with a documented and implemented lifecycle may be run.
+pub fn supports_managed(id: &str, os: &str, asset: &Asset) -> bool {
+    match package_kind(asset) {
+        Ok(PackageKind::TarGz) => matches!(os, "linux" | "freebsd" | "macos"),
+        Ok(PackageKind::AppImage) => os == "linux",
+        Ok(PackageKind::Zip) => os == "windows",
+        Ok(PackageKind::Dmg) => os == "macos",
+        Ok(PackageKind::Nsis) => os == "windows" && id == "artcraft",
+        Err(_) => false,
+    }
+}
+
 pub trait Platform: Send {
     fn os(&self) -> &str;
     fn arch(&self) -> &str;
     fn is_running(&self, executable: &Path) -> Result<bool>;
     fn launch(&self, executable: &Path) -> Result<Option<u32>>;
+    fn launch_with_log(&self, executable: &Path, _log: &Path) -> Result<Option<u32>> {
+        self.launch(executable)
+    }
+    fn open_project(&self, _executable: &Path, _project: &Path) -> Result<Option<u32>> {
+        Err(fail(
+            "Opening project files is unavailable on this platform.",
+        ))
+    }
     /// Returns (path to the app, optional deferred installer), both relative to staging.
     fn unpack(
         &self,
@@ -45,6 +65,45 @@ pub trait Platform: Send {
         stage: &Path,
         cancel: &AtomicBool,
     ) -> Result<(PathBuf, Option<PathBuf>)>;
+    fn unpack_product(
+        &self,
+        product: &crate::catalog::Product,
+        kind: PackageKind,
+        archive: &Path,
+        stage: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<(PathBuf, Option<PathBuf>)> {
+        self.unpack(&product.id, kind, archive, stage, cancel)
+    }
+    fn unpack_product_with_entrypoint(
+        &self,
+        product: &crate::catalog::Product,
+        kind: PackageKind,
+        archive: &Path,
+        stage: &Path,
+        cancel: &AtomicBool,
+        _entrypoint: Option<&str>,
+    ) -> Result<(PathBuf, Option<PathBuf>)> {
+        self.unpack_product(product, kind, archive, stage, cancel)
+    }
+    fn shortcut_product(&self, product: &crate::catalog::Product, executable: &Path) -> Result<()> {
+        self.shortcut(&product.id, executable)
+    }
+    /// None means this platform cannot inspect native shortcut targets.
+    fn check_shortcut_product(
+        &self,
+        _product: &crate::catalog::Product,
+        _executable: &Path,
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
+    fn remove_shortcut_product(
+        &self,
+        product: &crate::catalog::Product,
+        executable: &Path,
+    ) -> Result<()> {
+        self.remove_shortcut_for(&product.id, executable)
+    }
     fn finish_installer(&self, installer: &Path, app: &Path) -> Result<()>;
     fn shortcut(&self, id: &str, executable: &Path) -> Result<()>;
     fn remove_shortcut(&self, id: &str) -> Result<()>;
@@ -120,11 +179,116 @@ impl Platform for Native {
         if executable.extension().is_some_and(|ext| ext == "AppImage") {
             command.env("APPIMAGE_EXTRACT_AND_RUN", "1");
         }
-        let child = command.spawn()?;
+        let mut child = command.spawn()?;
         let pid = child.id();
-        // Reap after exit while allowing the app to survive the launcher.
+        // Only a non-zero exit that we can actually observe is a start error.
+        // A successful early exit may be an app forwarding to another process.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+        loop {
+            match child.try_wait()? {
+                Some(status) if !status.success() => {
+                    return Err(fail(format!("The app exited during startup ({status}).")));
+                }
+                Some(_) => return Ok(Some(pid)),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25))
+                }
+                None => break,
+            }
+        }
+        // Reap asynchronously. The app has independent stdio and can outlive the launcher.
         std::thread::spawn(move || {
-            let mut child = child;
+            let _ = child.wait();
+        });
+        Ok(Some(pid))
+    }
+    fn launch_with_log(&self, executable: &Path, log: &Path) -> Result<Option<u32>> {
+        #[cfg(target_os = "macos")]
+        if executable.extension().is_some_and(|ext| ext == "app") {
+            return self.launch(executable);
+        }
+        let helper = std::env::current_exe()?;
+        let is_launcher = helper
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("craftlauncher"));
+        if !is_launcher {
+            return self.launch(executable);
+        }
+        use std::io::{BufRead, BufReader};
+        let mut child = Command::new(helper)
+            .arg("--internal-monitor")
+            .arg(executable)
+            .arg("--internal-log")
+            .arg(log)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| fail("Could not read app monitor status."))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout)
+                .lines()
+                .map_while(std::result::Result::ok)
+            {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        let first = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .map_err(|_| fail("The app monitor could not start the application."))?;
+        let pid: u32 = first
+            .strip_prefix("START ")
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| fail("Invalid app monitor response."))?;
+        match rx.recv_timeout(std::time::Duration::from_millis(1200)) {
+            Ok(line) if line.starts_with("EXIT 0 ") => Err(fail(format!(
+                "The app exited during startup (code {}).",
+                line.trim_start_matches("EXIT 0 ")
+            ))),
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(Some(pid)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(fail("The app monitor exited before reporting its status."))
+            }
+        }
+    }
+    fn open_project(&self, executable: &Path, project: &Path) -> Result<Option<u32>> {
+        if !executable.exists() || !project.is_file() {
+            return Err(fail("The application or project file is missing."));
+        }
+        #[cfg(target_os = "macos")]
+        if executable.extension().is_some_and(|ext| ext == "app") {
+            let status = Command::new("/usr/bin/open")
+                .arg("-a")
+                .arg(executable)
+                .arg(project)
+                .status()?;
+            if !status.success() {
+                return Err(fail("macOS could not open this project."));
+            }
+            return Ok(None);
+        }
+        let mut command = Command::new(executable);
+        command
+            .arg(project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if executable.extension().is_some_and(|ext| ext == "AppImage") {
+            command.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+        }
+        let mut child = command.spawn()?;
+        let pid = child.id();
+        std::thread::spawn(move || {
             let _ = child.wait();
         });
         Ok(Some(pid))
@@ -137,6 +301,35 @@ impl Platform for Native {
         stage: &Path,
         cancel: &AtomicBool,
     ) -> Result<(PathBuf, Option<PathBuf>)> {
+        self.unpack_product(
+            &crate::catalog::Product::from(crate::app(id)?),
+            kind,
+            archive,
+            stage,
+            cancel,
+        )
+    }
+    fn unpack_product(
+        &self,
+        product: &crate::catalog::Product,
+        kind: PackageKind,
+        archive: &Path,
+        stage: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<(PathBuf, Option<PathBuf>)> {
+        self.unpack_product_with_entrypoint(product, kind, archive, stage, cancel, None)
+    }
+    fn unpack_product_with_entrypoint(
+        &self,
+        product: &crate::catalog::Product,
+        kind: PackageKind,
+        archive: &Path,
+        stage: &Path,
+        cancel: &AtomicBool,
+        entrypoint: Option<&str>,
+    ) -> Result<(PathBuf, Option<PathBuf>)> {
+        let legacy_id = product.id.as_str();
+        let id = product.executable_name.as_str();
         let payload = stage.join("payload");
         fs::create_dir_all(&payload)?;
         match kind {
@@ -168,7 +361,7 @@ impl Platform for Native {
                     None,
                 ));
             }
-            PackageKind::Dmg => unpack_dmg(archive, &payload, id)?,
+            PackageKind::Dmg => unpack_dmg(archive, &payload, id, entrypoint)?,
             PackageKind::Nsis => {
                 if self.os() != "windows" || id != "artcraft" {
                     return Err(fail("Unsupported native installer."));
@@ -181,12 +374,19 @@ impl Platform for Native {
                 ));
             }
         }
-        let executable = if self.os() == "macos" {
-            installer::find_bundle(&payload, id)?
+        let selected_entry = if kind == PackageKind::Dmg {
+            entrypoint
+                .and_then(|entry| Path::new(entry).file_name())
+                .and_then(|name| name.to_str())
         } else {
-            installer::find_executable(&payload, id)?
-        }
-        .ok_or_else(|| fail(format!("The release has no {id} application.")))?;
+            entrypoint
+        };
+        let executable = installer::resolve_entrypoint(
+            &payload,
+            &[id, legacy_id],
+            selected_entry,
+            self.os() == "macos",
+        )?;
         if self.os() != "macos" {
             installer::make_executable(&executable)?;
         }
@@ -224,20 +424,24 @@ impl Platform for Native {
         }
     }
     fn shortcut(&self, id: &str, executable: &Path) -> Result<()> {
-        let info = crate::app(id)?;
+        self.shortcut_product(&crate::catalog::Product::from(crate::app(id)?), executable)
+    }
+    fn shortcut_product(&self, product: &crate::catalog::Product, executable: &Path) -> Result<()> {
+        let info = product;
+        let id = product.id.as_str();
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
             let base = directories::BaseDirs::new()
                 .ok_or_else(|| fail("Cannot find the user data directory."))?;
-            crate::linux_integration::register_in(
+            crate::linux_integration::register_product_in(
                 &native_bin_directory(base.home_dir())?,
                 base.data_dir(),
-                id,
+                product,
                 executable,
             )?;
         }
         #[cfg(windows)]
-        windows_shortcut(info.name, executable)?;
+        windows_shortcut(&info.name, executable)?;
         #[cfg(target_os = "macos")]
         {
             let home = directories::BaseDirs::new()
@@ -255,8 +459,108 @@ impl Platform for Native {
             }
             std::os::unix::fs::symlink(executable, link)?;
         }
-        let _ = (info, executable);
+        let _ = (info, id, executable);
         Ok(())
+    }
+    fn check_shortcut_product(
+        &self,
+        product: &crate::catalog::Product,
+        executable: &Path,
+    ) -> Result<Option<bool>> {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let base = directories::BaseDirs::new()
+                .ok_or_else(|| fail("Cannot find the user data directory."))?;
+            Ok(Some(crate::linux_integration::check_product_in(
+                &native_bin_directory(base.home_dir())?,
+                base.data_dir(),
+                product,
+                executable,
+            )?))
+        }
+        #[cfg(windows)]
+        {
+            let base = directories::BaseDirs::new()
+                .ok_or_else(|| fail("Cannot find the user data directory."))?;
+            let link = base
+                .data_dir()
+                .join("Microsoft/Windows/Start Menu/Programs")
+                .join(format!("{} (CraftLauncher).lnk", product.name));
+            let _ = executable;
+            Ok(if link.is_file() { None } else { Some(false) })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let base = directories::BaseDirs::new()
+                .ok_or_else(|| fail("Cannot find the home directory."))?;
+            let link = base
+                .home_dir()
+                .join("Applications/CraftLauncher Apps")
+                .join(format!("{}.app", product.name));
+            let same_target = matches!((fs::canonicalize(&link), fs::canonicalize(executable)), (Ok(actual), Ok(expected)) if actual == expected);
+            Ok(Some(
+                link.symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                    && same_target,
+            ))
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            windows,
+            target_os = "macos"
+        )))]
+        {
+            let _ = (product, executable);
+            Ok(None)
+        }
+    }
+    fn remove_shortcut_product(
+        &self,
+        product: &crate::catalog::Product,
+        executable: &Path,
+    ) -> Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let base = directories::BaseDirs::new()
+                .ok_or_else(|| fail("Cannot find the user data directory."))?;
+            crate::linux_integration::remove_product_in(
+                &native_bin_directory(base.home_dir())?,
+                base.data_dir(),
+                product,
+                executable,
+            )
+        }
+        #[cfg(windows)]
+        {
+            let _ = executable;
+            if let Some(base) = directories::BaseDirs::new() {
+                remove_if_exists(
+                    &base
+                        .data_dir()
+                        .join("Microsoft/Windows/Start Menu/Programs")
+                        .join(format!("{} (CraftLauncher).lnk", product.name)),
+                )?;
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = executable;
+            if let Some(base) = directories::BaseDirs::new() {
+                let link = base
+                    .home_dir()
+                    .join("Applications/CraftLauncher Apps")
+                    .join(format!("{}.app", product.name));
+                if link
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    fs::remove_file(link)?;
+                }
+            }
+            Ok(())
+        }
     }
     fn remove_shortcut_for(&self, id: &str, executable: &Path) -> Result<()> {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -520,7 +824,12 @@ fn windows_shortcut(name: &str, executable: &Path) -> Result<()> {
     Ok(())
 }
 #[cfg(target_os = "macos")]
-fn unpack_dmg(archive: &Path, destination: &Path, id: &str) -> Result<()> {
+fn unpack_dmg(
+    archive: &Path,
+    destination: &Path,
+    id: &str,
+    entrypoint: Option<&str>,
+) -> Result<()> {
     let mount = tempfile::tempdir()?;
     let result = Command::new("/usr/bin/hdiutil")
         .args(["attach", "-readonly", "-nobrowse", "-mountpoint"])
@@ -540,8 +849,7 @@ fn unpack_dmg(archive: &Path, destination: &Path, id: &str) -> Result<()> {
         }
     }
     let _guard = Mounted(mount.path().into());
-    let bundle = installer::find_bundle(mount.path(), id)?
-        .ok_or_else(|| fail("The disk image has no app bundle."))?;
+    let bundle = installer::resolve_entrypoint(mount.path(), &[id], entrypoint, true)?;
     validate_bundle(&bundle, &bundle, 0)?;
     let target = destination.join(
         bundle
@@ -579,7 +887,12 @@ fn validate_bundle(root: &Path, folder: &Path, depth: usize) -> Result<()> {
     Ok(())
 }
 #[cfg(not(target_os = "macos"))]
-fn unpack_dmg(_archive: &Path, _destination: &Path, _id: &str) -> Result<()> {
+fn unpack_dmg(
+    _archive: &Path,
+    _destination: &Path,
+    _id: &str,
+    _entrypoint: Option<&str>,
+) -> Result<()> {
     Err(fail("Disk images require macOS."))
 }
 
@@ -591,4 +904,45 @@ pub fn notify(message: &str) {
             .body(&message)
             .show();
     });
+}
+
+#[cfg(test)]
+mod supported_package_tests {
+    use super::*;
+    fn asset(name: &str) -> Asset {
+        Asset {
+            name: name.into(),
+            browser_download_url: String::new(),
+            size: 1,
+            digest: None,
+        }
+    }
+    #[test]
+    fn generic_windows_installers_are_not_offered_as_managed() {
+        assert!(supports_managed(
+            "artcraft",
+            "windows",
+            &asset("ArtCraft_x64-setup.exe")
+        ));
+        assert!(!supports_managed(
+            "newcraft",
+            "windows",
+            &asset("newcraft-x64-setup.exe")
+        ));
+        assert!(supports_managed(
+            "newcraft",
+            "windows",
+            &asset("newcraft-windows-x64-portable.zip")
+        ));
+        assert!(!supports_managed(
+            "newcraft",
+            "linux",
+            &asset("newcraft-windows-x64-portable.zip")
+        ));
+        assert!(supports_managed(
+            "newcraft",
+            "linux",
+            &asset("newcraft-linux-x86_64.appimage")
+        ));
+    }
 }
