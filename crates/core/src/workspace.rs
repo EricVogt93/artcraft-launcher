@@ -1,5 +1,5 @@
 //! Project routing, update previews and bounded local application discovery.
-use crate::{CATALOG, Snapshot};
+use crate::Snapshot;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -15,8 +15,20 @@ pub struct RecentProject {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveredApp {
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub github_id: Option<u64>,
+    #[serde(default)]
+    pub unavailable: bool,
     pub repository: String,
     pub description: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveryPage {
+    pub etag: Option<String>,
+    pub apps: Vec<DiscoveredApp>,
+    pub last: bool,
 }
 #[derive(Clone, Debug)]
 pub struct LocalApp {
@@ -32,27 +44,41 @@ pub struct UpdatePreview {
     pub pinned: bool,
 }
 pub fn update_preview(snapshot: &Snapshot) -> Vec<UpdatePreview> {
-    CATALOG
+    snapshot
+        .products
         .iter()
         .filter_map(|app| {
-            let install = snapshot.state.installations.get(app.id)?;
-            let release = snapshot.state.releases.get(app.id)?.release.as_ref()?;
+            let install = snapshot.state.installations.get(&app.id)?;
+            let release = snapshot.state.releases.get(&app.id)?.release.as_ref()?;
             if !install.managed
-                || snapshot.state.pending.contains_key(app.id)
+                || snapshot.state.pending.contains_key(&app.id)
                 || !crate::model::is_newer(&release.tag_name, &install.version)
             {
                 return None;
             }
-            let asset = crate::releases::asset_for(release, &snapshot.platform, &snapshot.arch)?;
+            let preference = snapshot.state.preferences.get(&app.id);
+            let key = crate::releases::asset_preference_key(&snapshot.platform, &snapshot.arch);
+            let asset = crate::releases::resolve_asset(
+                release,
+                &snapshot.platform,
+                &snapshot.arch,
+                preference
+                    .and_then(|p| p.selected_assets.get(&key))
+                    .map(String::as_str),
+            )
+            .selected()?;
+            if !crate::platform::supports_managed(&app.id, &snapshot.platform, asset) {
+                return None;
+            }
             Some(UpdatePreview {
-                app_id: app.id.into(),
+                app_id: app.id.clone(),
                 current: install.version.clone(),
                 next: release.tag_name.clone(),
                 bytes: asset.size,
                 pinned: snapshot
                     .state
                     .preferences
-                    .get(app.id)
+                    .get(&app.id)
                     .is_some_and(|p| p.pinned_version.is_some()),
             })
         })
@@ -126,11 +152,15 @@ pub fn discover_local(roots: &[PathBuf], snapshot: &Snapshot) -> Vec<LocalApp> {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
-        for app in CATALOG {
-            if snapshot.state.installations.contains_key(app.id) {
+        for app in &snapshot.products {
+            if snapshot.state.installations.contains_key(&app.id) {
                 continue;
             }
-            for name in [app.executable_name(), app.id, app.name] {
+            for name in [
+                app.executable_name.as_str(),
+                app.id.as_str(),
+                app.name.as_str(),
+            ] {
                 let mut candidates = vec![
                     name.to_string(),
                     format!("{name}.exe"),
@@ -189,9 +219,9 @@ pub fn discover_local(roots: &[PathBuf], snapshot: &Snapshot) -> Vec<LocalApp> {
                     {
                         continue;
                     }
-                    if seen.insert((app.id, path.clone())) {
+                    if seen.insert((app.id.clone(), path.clone())) {
                         found.push(LocalApp {
-                            app_id: app.id.into(),
+                            app_id: app.id.clone(),
                             executable: path,
                         });
                     }
