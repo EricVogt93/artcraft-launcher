@@ -49,14 +49,17 @@ pub fn update_preview(snapshot: &Snapshot) -> Vec<UpdatePreview> {
         .iter()
         .filter_map(|app| {
             let install = snapshot.state.installations.get(&app.id)?;
-            let release = snapshot.state.releases.get(&app.id)?.release.as_ref()?;
+            let preference = snapshot.state.preferences.get(&app.id);
+            let channel = preference
+                .and_then(|p| p.channel)
+                .unwrap_or(snapshot.state.settings.channel);
+            let release = snapshot.state.releases.get(&app.id)?.release_for(channel)?;
             if !install.managed
                 || snapshot.state.pending.contains_key(&app.id)
                 || !crate::model::is_newer(&release.tag_name, &install.version)
             {
                 return None;
             }
-            let preference = snapshot.state.preferences.get(&app.id);
             let key = crate::releases::asset_preference_key(&snapshot.platform, &snapshot.arch);
             let asset = crate::releases::resolve_asset(
                 release,
@@ -93,6 +96,9 @@ pub fn project_apps(path: &Path) -> Vec<&'static str> {
         .to_ascii_lowercase()
         .as_str()
     {
+        "artcraft" | "blend" | "glb" | "gltf" | "obj" | "fbx" | "usd" | "usda" | "usdc"
+        | "usdz" => vec!["artcraft"],
+        "anicraft" | "gif" | "apng" => vec!["anicraft"],
         "psd" | "psb" | "ora" | "xcf" => vec!["photocraft"],
         "png" | "jpg" | "jpeg" | "webp" | "tif" | "tiff" => vec!["photocraft", "lightcraft"],
         "raw" | "cr2" | "cr3" | "nef" | "arw" | "dng" | "raf" | "orf" => vec!["lightcraft"],
@@ -145,86 +151,98 @@ pub fn discover_local(roots: &[PathBuf], snapshot: &Snapshot) -> Vec<LocalApp> {
     let mut found = Vec::new();
     let mut seen = BTreeSet::new();
     for root in roots {
-        let entries: Vec<_> = std::fs::read_dir(root)
-            .into_iter()
-            .flatten()
+        let Ok(read_dir) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let entries: Vec<String> = read_dir
             .take(2000)
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
+        if entries.is_empty() {
+            continue;
+        }
         for app in &snapshot.products {
             if snapshot.state.installations.contains_key(&app.id) {
                 continue;
             }
-            for name in [
+            let names = [
                 app.executable_name.as_str(),
                 app.id.as_str(),
                 app.name.as_str(),
-            ] {
-                let mut candidates = vec![
-                    name.to_string(),
-                    format!("{name}.exe"),
-                    format!("{name}.AppImage"),
-                    format!("{name}.app"),
-                    format!("{name}/{name}.exe"),
-                    format!("{name}/bin/{name}"),
-                    format!("{name}/{name}"),
-                ];
-                candidates.extend(
-                    entries
-                        .iter()
-                        .filter(|entry| {
-                            entry
-                                .strip_prefix(&format!("{name}-"))
-                                .is_some_and(|suffix| {
-                                    suffix.starts_with(|c: char| c.is_ascii_digit())
-                                        && suffix.ends_with(".AppImage")
+            ];
+            let mut candidates = Vec::new();
+            for entry in &entries {
+                let entry_lower = entry.to_ascii_lowercase();
+                let matches_direct = names.iter().any(|name| {
+                    let n = name.to_ascii_lowercase();
+                    entry_lower == n
+                        || entry_lower == format!("{n}.exe")
+                        || entry_lower == format!("{n}.appimage")
+                        || entry_lower == format!("{n}.app")
+                        || (entry_lower.ends_with(".appimage")
+                            && [format!("{n}-"), format!("{n}_")].iter().any(|prefix| {
+                                entry_lower.strip_prefix(prefix).is_some_and(|rest| {
+                                    rest.starts_with(|c: char| c.is_ascii_digit())
+                                        || rest.strip_prefix('v').is_some_and(|v| {
+                                            v.starts_with(|c: char| c.is_ascii_digit())
+                                        })
                                 })
-                        })
-                        .cloned(),
-                );
-                for relative in candidates {
-                    let path = root.join(relative);
-                    let Ok(path) = path.canonicalize() else {
-                        continue;
-                    };
-                    // Ignore this launcher's managed wrappers and payloads.
-                    if path.starts_with(&snapshot.root) {
-                        continue;
+                            }))
+                });
+                if matches_direct {
+                    candidates.push(PathBuf::from(entry));
+                }
+                if names.iter().any(|name| entry.eq_ignore_ascii_case(name)) {
+                    for exec in names {
+                        candidates.push(PathBuf::from(entry).join(exec));
+                        candidates.push(PathBuf::from(entry).join(format!("{exec}.exe")));
+                        candidates.push(PathBuf::from(entry).join("bin").join(exec));
+                        candidates
+                            .push(PathBuf::from(entry).join("bin").join(format!("{exec}.exe")));
                     }
-                    if path.is_file() {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if path
-                                .metadata()
-                                .map(|m| m.permissions().mode() & 0o111 == 0)
-                                .unwrap_or(true)
-                            {
-                                continue;
-                            }
-                        }
-                        let mut bytes = Vec::new();
-                        if std::fs::File::open(&path)
-                            .and_then(|f| f.take(256).read_to_end(&mut bytes))
-                            .is_ok()
-                            && String::from_utf8_lossy(&bytes)
-                                .contains("# Managed by CraftLauncher:")
+                }
+            }
+            for relative in candidates {
+                let path = root.join(relative);
+                let Ok(path) = path.canonicalize() else {
+                    continue;
+                };
+                // Ignore this launcher's managed wrappers and payloads.
+                if path.starts_with(&snapshot.root) {
+                    continue;
+                }
+                if path.is_file() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if path
+                            .metadata()
+                            .map(|m| m.permissions().mode() & 0o111 == 0)
+                            .unwrap_or(true)
                         {
                             continue;
                         }
-                    } else if !(cfg!(target_os = "macos")
-                        && path.extension().is_some_and(|e| e == "app")
-                        && path.is_dir())
+                    }
+                    let mut bytes = Vec::new();
+                    if std::fs::File::open(&path)
+                        .and_then(|f| f.take(256).read_to_end(&mut bytes))
+                        .is_ok()
+                        && String::from_utf8_lossy(&bytes).contains("# Managed by CraftLauncher:")
                     {
                         continue;
                     }
-                    if seen.insert((app.id.clone(), path.clone())) {
-                        found.push(LocalApp {
-                            app_id: app.id.clone(),
-                            executable: path,
-                        });
-                    }
+                } else if !(cfg!(target_os = "macos")
+                    && path.extension().is_some_and(|e| e == "app")
+                    && path.is_dir())
+                {
+                    continue;
+                }
+                if seen.insert((app.id.clone(), path.clone())) {
+                    found.push(LocalApp {
+                        app_id: app.id.clone(),
+                        executable: path,
+                    });
                 }
             }
         }
@@ -237,6 +255,8 @@ mod tests {
     use super::*;
     #[test]
     fn project_routing_handles_case_and_shared_formats_without_guessing_unknown_files() {
+        assert_eq!(project_apps(Path::new("scene.GLB")), vec!["artcraft"]);
+        assert_eq!(project_apps(Path::new("clip.anicraft")), vec!["anicraft"]);
         assert_eq!(project_apps(Path::new("work.PSD")), vec!["photocraft"]);
         assert_eq!(
             project_apps(Path::new("report.PDF")),

@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -48,11 +48,13 @@ pub fn capture(executable: &Path, log: &Path, mut event: impl FnMut(MonitorEvent
         .stderr
         .take()
         .ok_or_else(|| fail("Cannot capture app output."))?;
-    let buffer = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+    let buffer = Arc::new(Mutex::new(VecDeque::<u8>::with_capacity(LIMIT.min(16384))));
+    let dirty = Arc::new(AtomicBool::new(false));
     let readers = Arc::new(AtomicUsize::new(2));
     fn drain(
         mut source: impl Read + Send + 'static,
         buffer: Arc<Mutex<VecDeque<u8>>>,
+        dirty: Arc<AtomicBool>,
         readers: Arc<AtomicUsize>,
     ) {
         std::thread::spawn(move || {
@@ -62,12 +64,18 @@ pub fn capture(executable: &Path, log: &Path, mut event: impl FnMut(MonitorEvent
                     break;
                 }
                 if let Ok(mut tail) = buffer.lock() {
-                    for byte in &chunk[..n] {
-                        if tail.len() == LIMIT {
-                            tail.pop_front();
+                    let slice = &chunk[..n];
+                    if slice.len() >= LIMIT {
+                        tail.clear();
+                        tail.extend(&slice[slice.len() - LIMIT..]);
+                    } else {
+                        let overflow = (tail.len() + slice.len()).saturating_sub(LIMIT);
+                        if overflow > 0 {
+                            tail.drain(..overflow);
                         }
-                        tail.push_back(*byte);
+                        tail.extend(slice);
                     }
+                    dirty.store(true, Ordering::Release);
                 } else {
                     break;
                 }
@@ -75,8 +83,8 @@ pub fn capture(executable: &Path, log: &Path, mut event: impl FnMut(MonitorEvent
             readers.fetch_sub(1, Ordering::Release);
         });
     }
-    drain(stdout, buffer.clone(), readers.clone());
-    drain(stderr, buffer.clone(), readers.clone());
+    drain(stdout, buffer.clone(), dirty.clone(), readers.clone());
+    drain(stderr, buffer.clone(), dirty.clone(), readers.clone());
     event(MonitorEvent::Started(child.id()));
     let mut exited = false;
     let mut last_flush = Instant::now() - Duration::from_secs(1);
@@ -90,14 +98,18 @@ pub fn capture(executable: &Path, log: &Path, mut event: impl FnMut(MonitorEvent
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            if let Ok(tail) = buffer.lock() {
+            if dirty.swap(false, Ordering::AcqRel)
+                && let Ok(tail) = buffer.lock()
+            {
                 let bytes: Vec<u8> = tail.iter().copied().collect();
                 let _ = atomic_write(log, &bytes);
             }
             event(MonitorEvent::Exited(status.code(), status.success()));
         }
         if last_flush.elapsed() >= Duration::from_secs(1) {
-            if let Ok(tail) = buffer.lock() {
+            if dirty.swap(false, Ordering::AcqRel)
+                && let Ok(tail) = buffer.lock()
+            {
                 let bytes: Vec<u8> = tail.iter().copied().collect();
                 let _ = atomic_write(log, &bytes);
             }
@@ -107,7 +119,9 @@ pub fn capture(executable: &Path, log: &Path, mut event: impl FnMut(MonitorEvent
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    if let Ok(tail) = buffer.lock() {
+    if dirty.swap(false, Ordering::AcqRel)
+        && let Ok(tail) = buffer.lock()
+    {
         let bytes: Vec<u8> = tail.iter().copied().collect();
         atomic_write(log, &bytes)?;
     }

@@ -20,6 +20,7 @@ pub struct CachedDownload {
 pub struct StorageReport {
     pub apps: Vec<AppStorage>,
     pub downloads: Vec<CachedDownload>,
+    pub launcher_bytes: u64,
 }
 
 pub fn directory_size(path: &Path) -> Result<u64> {

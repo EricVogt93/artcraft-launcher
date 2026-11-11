@@ -16,7 +16,7 @@ pub enum PackageKind {
 }
 pub fn package_kind(asset: &Asset) -> Result<PackageKind> {
     let name = asset.name.to_ascii_lowercase();
-    if name.ends_with(".tar.gz") {
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         Ok(PackageKind::TarGz)
     } else if name.ends_with(".appimage") {
         Ok(PackageKind::AppImage)
@@ -36,7 +36,7 @@ pub fn supports_managed(id: &str, os: &str, asset: &Asset) -> bool {
     match package_kind(asset) {
         Ok(PackageKind::TarGz) => matches!(os, "linux" | "freebsd" | "macos"),
         Ok(PackageKind::AppImage) => os == "linux",
-        Ok(PackageKind::Zip) => os == "windows",
+        Ok(PackageKind::Zip) => matches!(os, "windows" | "macos"),
         Ok(PackageKind::Dmg) => os == "macos",
         Ok(PackageKind::Nsis) => os == "windows" && id == "artcraft",
         Err(_) => false,
@@ -47,6 +47,15 @@ pub trait Platform: Send {
     fn os(&self) -> &str;
     fn arch(&self) -> &str;
     fn is_running(&self, executable: &Path) -> Result<bool>;
+    fn running_apps(
+        &self,
+        executables: &std::collections::BTreeMap<String, PathBuf>,
+    ) -> std::collections::BTreeMap<String, bool> {
+        executables
+            .iter()
+            .map(|(id, path)| (id.clone(), self.is_running(path).unwrap_or(true)))
+            .collect()
+    }
     fn launch(&self, executable: &Path) -> Result<Option<u32>>;
     fn launch_with_log(&self, executable: &Path, _log: &Path) -> Result<Option<u32>> {
         self.launch(executable)
@@ -129,30 +138,29 @@ impl Platform for Native {
                 "Process detection is unavailable on this system; update activation is deferred.",
             ));
         }
-        let target = fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
-        let directory = if target.extension().is_some_and(|x| x == "app") {
-            target.clone()
-        } else {
-            target.parent().unwrap_or(&target).to_path_buf()
-        };
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        for process in system.processes().values() {
-            if let Some(exe) = process.exe() {
-                let exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
-                #[cfg(windows)]
-                let matched = exe
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .starts_with(&format!("{}\\", directory.to_string_lossy().to_lowercase()));
-                #[cfg(not(windows))]
-                let matched = exe.starts_with(&directory);
-                if matched {
-                    return Ok(true);
-                }
-            }
+        let dir = app_process_directory(executable);
+        let running = collect_running_executables();
+        Ok(running.iter().any(|exe| process_matches_dir(exe, &dir)))
+    }
+    fn running_apps(
+        &self,
+        executables: &std::collections::BTreeMap<String, PathBuf>,
+    ) -> std::collections::BTreeMap<String, bool> {
+        if executables.is_empty() {
+            return std::collections::BTreeMap::new();
         }
-        Ok(false)
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return executables.keys().map(|id| (id.clone(), true)).collect();
+        }
+        let running = collect_running_executables();
+        executables
+            .iter()
+            .map(|(id, executable)| {
+                let dir = app_process_directory(executable);
+                let active = running.iter().any(|exe| process_matches_dir(exe, &dir));
+                (id.clone(), active)
+            })
+            .collect()
     }
     fn launch(&self, executable: &Path) -> Result<Option<u32>> {
         if !executable.exists() {
@@ -204,9 +212,16 @@ impl Platform for Native {
     }
     fn launch_with_log(&self, executable: &Path, log: &Path) -> Result<Option<u32>> {
         #[cfg(target_os = "macos")]
-        if executable.extension().is_some_and(|ext| ext == "app") {
-            return self.launch(executable);
-        }
+        let resolved_bundle_exec = if executable.extension().is_some_and(|ext| ext == "app") {
+            let Some(inner) = macos_bundle_executable(executable) else {
+                return self.launch(executable);
+            };
+            Some(inner)
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let executable = resolved_bundle_exec.as_deref().unwrap_or(executable);
         let helper = std::env::current_exe()?;
         let is_launcher = helper
             .file_stem()
@@ -480,14 +495,7 @@ impl Platform for Native {
         }
         #[cfg(windows)]
         {
-            let base = directories::BaseDirs::new()
-                .ok_or_else(|| fail("Cannot find the user data directory."))?;
-            let link = base
-                .data_dir()
-                .join("Microsoft/Windows/Start Menu/Programs")
-                .join(format!("{} (CraftLauncher).lnk", product.name));
-            let _ = executable;
-            Ok(if link.is_file() { None } else { Some(false) })
+            Ok(Some(check_windows_shortcut(&product.name, executable)?))
         }
         #[cfg(target_os = "macos")]
         {
@@ -705,13 +713,70 @@ fn native_bin_directory(home: &Path) -> Result<PathBuf> {
     Ok(directory)
 }
 
+fn app_process_directory(executable: &Path) -> PathBuf {
+    let target = fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+    if target.extension().is_some_and(|x| x == "app") {
+        target
+    } else {
+        target.parent().unwrap_or(&target).to_path_buf()
+    }
+}
+
+fn collect_running_executables() -> Vec<PathBuf> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut result = Vec::new();
+    for process in system.processes().values() {
+        if let Some(exe) = process.exe()
+            && seen.insert(exe.to_path_buf())
+        {
+            result.push(fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf()));
+        }
+    }
+    result
+}
+
+fn process_matches_dir(exe: &Path, directory: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        exe.to_string_lossy()
+            .to_lowercase()
+            .starts_with(&format!("{}\\", directory.to_string_lossy().to_lowercase()))
+    }
+    #[cfg(not(windows))]
+    {
+        exe.starts_with(directory)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_executable(bundle: &Path) -> Option<PathBuf> {
+    let macos_dir = bundle.join("Contents/MacOS");
+    let stem = bundle.file_stem()?.to_str()?;
+    let direct = macos_dir.join(stem);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let mut entries = fs::read_dir(macos_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()));
+    let first = entries.next()?;
+    if entries.next().is_none() {
+        Some(first.path())
+    } else {
+        None
+    }
+}
+
 fn unpack_appimage(archive: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
     use std::{
         sync::atomic::Ordering,
         time::{Duration, Instant},
     };
     if cancel.load(Ordering::Relaxed) {
-        return Err(fail("AppImage extraction cancelled."));
+        return Err(crate::cancelled("AppImage extraction cancelled."));
     }
     let mut child = Command::new(archive)
         .arg("--appimage-extract")
@@ -725,11 +790,11 @@ fn unpack_appimage(archive: &Path, destination: &Path, cancel: &AtomicBool) -> R
         if cancel.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(120) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(fail(if cancel.load(Ordering::Relaxed) {
-                "AppImage extraction cancelled."
+            return Err(if cancel.load(Ordering::Relaxed) {
+                crate::cancelled("AppImage extraction cancelled.")
             } else {
-                "AppImage extraction timed out."
-            }));
+                fail("AppImage extraction timed out.")
+            });
         }
         if let Some(status) = child.try_wait()? {
             if !status.success() {
@@ -807,7 +872,30 @@ fn xml_escape(s: &str) -> String {
 }
 
 #[cfg(windows)]
+fn check_windows_shortcut(name: &str, executable: &Path) -> Result<bool> {
+    let base =
+        directories::BaseDirs::new().ok_or_else(|| fail("Cannot find the user data directory."))?;
+    let link = base
+        .data_dir()
+        .join("Microsoft/Windows/Start Menu/Programs")
+        .join(format!("{name} (CraftLauncher).lnk"));
+    if !link.is_file() {
+        return Ok(false);
+    }
+    let bytes = fs::read(&link)?;
+    let expected = executable.to_string_lossy();
+    let utf16: Vec<u8> = expected.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    Ok(bytes
+        .windows(expected.len())
+        .any(|w| w.eq_ignore_ascii_case(expected.as_bytes()))
+        || (!utf16.is_empty() && bytes.windows(utf16.len()).any(|w| w == utf16.as_slice())))
+}
+
+#[cfg(windows)]
 fn windows_shortcut(name: &str, executable: &Path) -> Result<()> {
+    if check_windows_shortcut(name, executable).unwrap_or(false) {
+        return Ok(());
+    }
     let base =
         directories::BaseDirs::new().ok_or_else(|| fail("Cannot find the user data directory."))?;
     let directory = base
