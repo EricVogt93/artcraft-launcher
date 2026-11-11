@@ -101,9 +101,8 @@ impl Manager {
             .read(true)
             .write(true)
             .open(root.join(".lock"))?;
-        lock.try_lock_exclusive().map_err(|_| {
-            fail("CraftLauncher is already using this library. Close the other instance first.")
-        })?;
+        lock.try_lock_exclusive()
+            .map_err(|_| crate::Error::LibraryLocked)?;
         let state_path = root.join("state.json");
         let mut recovery = None;
         let state = match File::open(&state_path) {
@@ -251,6 +250,26 @@ impl Manager {
                 Err(e) => return Err(e.into()),
             }
         }
+        let launcher_versions = self.root.join("launcher/versions");
+        if launcher_versions
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Err(fail("Launcher version root cannot be a symlink."));
+        }
+        match fs::read_dir(&launcher_versions) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(".staging-") && entry.file_type()?.is_dir() {
+                        fs::remove_dir_all(entry.path())?;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
     pub fn save(&self) -> Result<()> {
@@ -296,6 +315,48 @@ impl Manager {
             return Err(e);
         }
         fs::remove_file(path)?;
+        self.cleanup_launcher_versions()?;
+        Ok(())
+    }
+    fn cleanup_launcher_versions(&self) -> Result<()> {
+        if self.root.join("launcher/update-job.json").exists() {
+            return Ok(());
+        }
+        let versions_dir = self.root.join("launcher/versions");
+        let Ok(entries) = fs::read_dir(&versions_dir) else {
+            return Ok(());
+        };
+        let versions_canon = fs::canonicalize(&versions_dir)?;
+        let active = crate::self_update::current_executable(&self.root)
+            .ok()
+            .flatten()
+            .and_then(|exe| fs::canonicalize(exe).ok());
+        let prepared = self
+            .state
+            .launcher_update
+            .as_ref()
+            .and_then(|u| fs::canonicalize(self.root.join(&u.directory)).ok());
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".staging-") {
+                continue;
+            }
+            let Ok(path) = fs::canonicalize(entry.path()) else {
+                continue;
+            };
+            if !path.starts_with(&versions_canon) {
+                continue;
+            }
+            let is_active = active.as_ref().is_some_and(|exe| exe.starts_with(&path));
+            let is_prepared = prepared.as_ref() == Some(&path);
+            if !is_active && !is_prepared {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
         Ok(())
     }
     pub fn check_launcher_update(&mut self, force: bool, cancel: &AtomicBool) -> Result<()> {
@@ -335,18 +396,21 @@ impl Manager {
         }
     }
     pub fn snapshot(&self) -> Snapshot {
-        let running = self
-            .state
-            .installations
-            .iter()
-            .map(|(id, install)| {
-                let running = self
-                    .executable(id, install)
-                    .and_then(|p| self.platform.is_running(&p))
-                    .unwrap_or(true);
-                (id.clone(), running)
-            })
-            .collect();
+        let mut executables = BTreeMap::new();
+        let mut running = BTreeMap::new();
+        for (id, install) in &self.state.installations {
+            match self.executable(id, install) {
+                Ok(path) => {
+                    executables.insert(id.clone(), path);
+                }
+                Err(_) => {
+                    running.insert(id.clone(), true);
+                }
+            }
+        }
+        for (id, is_running) in self.platform.running_apps(&executables) {
+            running.insert(id, is_running);
+        }
         Snapshot {
             products: crate::catalog::products(&self.state.discovered_apps),
             state: self.state.clone(),
@@ -393,19 +457,19 @@ impl Manager {
             .unwrap_or(self.state.settings.channel)
     }
     pub fn selected_release(&self, id: &str) -> Option<&Release> {
+        let channel = self.channel(id);
         let cache = self
             .state
             .releases
             .get(id)
-            .filter(|c| c.channel == self.channel(id))?;
+            .filter(|c| c.channel == channel || !c.versions.is_empty())?;
         if let Some(pin) = self.preferences(id).pinned_version {
             cache
-                .versions
-                .iter()
+                .versions_for(channel)
                 .find(|r| r.tag_name == pin)
-                .or_else(|| cache.release.as_ref().filter(|r| r.tag_name == pin))
+                .or_else(|| cache.release_for(channel).filter(|r| r.tag_name == pin))
         } else {
-            cache.release.as_ref()
+            cache.release_for(channel)
         }
     }
     pub fn asset_for_release<'a>(
@@ -536,7 +600,7 @@ impl Manager {
         let mut errors = Vec::new();
         for (index, id) in ids.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
-                return Err(fail(format!(
+                return Err(crate::cancelled(format!(
                     "Download batch cancelled. {saved} completed packages were kept."
                 )));
             }
@@ -597,7 +661,7 @@ impl Manager {
                     },
                 )?;
                 if cancel.load(Ordering::Relaxed) {
-                    return Err(fail("Download cancelled."));
+                    return Err(crate::cancelled("Download cancelled."));
                 }
                 if digest != checksum || file.metadata()?.len() != asset.size {
                     let _ = fs::remove_file(&file);
@@ -635,7 +699,7 @@ impl Manager {
             self.save()?;
         }
         if cancel.load(Ordering::Relaxed) {
-            return Err(fail(format!(
+            return Err(crate::cancelled(format!(
                 "Download batch cancelled. {saved} completed packages were kept."
             )));
         }
@@ -650,6 +714,11 @@ impl Manager {
         }
     }
     pub fn refresh_app(&mut self, id: &str) -> Result<()> {
+        let result = self.refresh_app_in_memory(id);
+        self.save()?;
+        result
+    }
+    fn refresh_app_in_memory(&mut self, id: &str) -> Result<()> {
         let product = self.product(id)?;
         if product.unavailable {
             return Err(fail("The product repository is unavailable."));
@@ -661,7 +730,6 @@ impl Manager {
         {
             Ok(cache) => {
                 self.state.releases.insert(id.into(), cache);
-                self.save()?;
                 Ok(())
             }
             Err(e) => {
@@ -680,8 +748,11 @@ impl Manager {
                     });
                 cache.error = Some(message.clone());
                 self.record(Some(id), "release check", &message, true);
-                self.save()?;
-                Err(fail(message))
+                if matches!(e, crate::Error::RateLimited) {
+                    Err(crate::Error::RateLimited)
+                } else {
+                    Err(fail(message))
+                }
             }
         }
     }
@@ -693,12 +764,14 @@ impl Manager {
         let mut errors = Vec::new();
         for info in crate::catalog::products(&self.state.discovered_apps) {
             if cancel.load(Ordering::Relaxed) {
-                return Err(fail("Release check cancelled."));
+                self.save()?;
+                return Err(crate::cancelled("Release check cancelled."));
             }
             if !info.unavailable {
-                if let Err(error) = self.refresh_app(&info.id) {
+                if let Err(error) = self.refresh_app_in_memory(&info.id) {
                     let message = error.to_string();
-                    let rate_limited = message.contains("GitHub rate limit reached");
+                    let rate_limited = matches!(error, crate::Error::RateLimited)
+                        || message.contains("GitHub rate limit reached");
                     errors.push(format!("{}: {message}", info.name));
                     changed(self.snapshot());
                     if rate_limited {
@@ -721,17 +794,30 @@ impl Manager {
         }
     }
     pub fn configure(&mut self, settings: Settings, launcher: &Path) -> Result<()> {
-        let before = self.state.settings.clone();
-        if settings.launch_at_login != before.launch_at_login {
+        let before = self.state.clone();
+        if settings.launch_at_login != before.settings.launch_at_login {
             self.platform
                 .autostart(settings.launch_at_login, launcher, &self.root)?;
         }
+        let channel_changed = settings.channel != before.settings.channel;
         self.state.settings = settings;
+        if channel_changed {
+            let global_channel = self.state.settings.channel;
+            for (id, cache) in &mut self.state.releases {
+                let app_channel = self
+                    .state
+                    .preferences
+                    .get(id)
+                    .and_then(|p| p.channel)
+                    .unwrap_or(global_channel);
+                cache.set_channel(app_channel);
+            }
+        }
         if let Err(e) = self.save() {
-            self.state.settings = before.clone();
+            self.state = before.clone();
             let _ = self
                 .platform
-                .autostart(before.launch_at_login, launcher, &self.root);
+                .autostart(before.settings.launch_at_login, launcher, &self.root);
             return Err(e);
         }
         Ok(())
@@ -740,6 +826,10 @@ impl Manager {
         self.product(id)?;
         let before = self.state.clone();
         self.state.preferences.insert(id.into(), preferences);
+        let channel = self.channel(id);
+        if let Some(cache) = self.state.releases.get_mut(id) {
+            cache.set_channel(channel);
+        }
         let pending = if self.state.preferences[id].channel
             != before
                 .preferences
@@ -1077,7 +1167,7 @@ impl Manager {
             .state
             .releases
             .get(id)
-            .filter(|c| c.channel == self.channel(id))
+            .filter(|c| c.channel == self.channel(id) || !c.versions.is_empty())
             .ok_or_else(|| fail("Check for releases first."))?;
         let release = if let Some(version) = requested_version {
             cache
@@ -1123,7 +1213,7 @@ impl Manager {
             });
             let checksum = self.remote.checksum_product(&info, &asset, &release)?;
             if cancel.load(Ordering::Relaxed) {
-                return Err(fail("Download cancelled."));
+                return Err(crate::cancelled("Download cancelled."));
             }
             let archive = self.partial_path(&info, &release, &asset, &checksum)?;
             let mut meter = TransferMeter::default();
@@ -1166,7 +1256,7 @@ impl Manager {
             fs::remove_file(archive)?;
             crate::inventory::create(&stage)?;
             if cancel.load(Ordering::Relaxed) {
-                return Err(fail("Download cancelled."));
+                return Err(crate::cancelled("Download cancelled."));
             }
             fs::create_dir_all(
                 destination
@@ -1492,7 +1582,7 @@ impl Manager {
                 continue;
             }
             if cancel.load(Ordering::Relaxed) {
-                return Err(fail("Update check cancelled."));
+                return Err(crate::cancelled("Update check cancelled."));
             }
             let preference = self.preferences(info);
             if !preference.auto_update
@@ -1517,7 +1607,10 @@ impl Manager {
         self.activate_all_pending()
     }
     pub fn storage_report(&self) -> Result<crate::storage::StorageReport> {
-        let mut report = crate::storage::StorageReport::default();
+        let mut report = crate::storage::StorageReport {
+            launcher_bytes: crate::storage::directory_size(&self.root.join("launcher/versions"))?,
+            ..Default::default()
+        };
         for (id, install) in &self.state.installations {
             if !install.managed {
                 continue;

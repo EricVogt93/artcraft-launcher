@@ -52,15 +52,17 @@ fn check_destination(path: &Path, marker: &str) -> Result<()> {
     }
     Ok(())
 }
-fn app_icon(executable: &Path, id: &str) -> Option<PathBuf> {
+fn app_icon(executable: &Path, info: &crate::catalog::Product) -> Option<PathBuf> {
     let folder = executable.parent()?;
     let roots = [folder.to_path_buf(), folder.parent()?.to_path_buf()];
+    let stems = [&info.id, &info.executable_name, &info.name];
     for root in roots {
-        for name in [
-            ".DirIcon".to_owned(),
-            format!("{id}.png"),
-            format!("{id}.svg"),
-        ] {
+        let mut names = vec![".DirIcon".to_owned()];
+        for stem in stems {
+            names.push(format!("{stem}.png"));
+            names.push(format!("{stem}.svg"));
+        }
+        for name in names {
             let path = root.join(name);
             if path.is_file()
                 && let Ok(path) = path.canonicalize()
@@ -70,6 +72,15 @@ fn app_icon(executable: &Path, id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn desktop_categories(discipline: &str) -> &'static str {
+    match discipline {
+        "Audio production" => "AudioVideo;Audio;",
+        "Video & animation" => "AudioVideo;Video;Graphics;",
+        "Office & productivity" | "PDF & publishing" => "Office;Graphics;",
+        _ => "Graphics;",
+    }
 }
 
 pub fn register(home: &Path, data: &Path, id: &str, executable: &Path) -> Result<()> {
@@ -96,17 +107,19 @@ pub fn register_product_in(
     let desktop_marker = format!("X-CraftLauncher-App={id}\n");
     check_destination(&bin, &marker(id))?;
     check_destination(&desktop, &desktop_marker)?;
-    let icon = app_icon(executable, id)
+    let icon = app_icon(executable, info)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "applications-graphics".into());
+    let categories = desktop_categories(&info.discipline);
     let text = format!(
-        "[Desktop Entry]\nVersion=1.0\nType=Application\nName={}\nGenericName={}\nComment={}\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=Graphics;\nKeywords={};\nStartupNotify=true\n{}X-CraftLauncher-Executable={}\n",
+        "[Desktop Entry]\nVersion=1.0\nType=Application\nName={}\nGenericName={}\nComment={}\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories={}\nKeywords={};\nStartupNotify=true\n{}X-CraftLauncher-Executable={}\n",
         info.name,
         info.category,
         info.description.replace(['\n', '\r'], " "),
         desktop_quote(&bin),
         bin.display(),
         icon,
+        categories,
         info.tags.join(";"),
         desktop_marker,
         executable.display()

@@ -640,15 +640,14 @@ impl Launcher {
             .state
             .releases
             .get(id)
-            .filter(|c| c.channel == channel)?;
+            .filter(|c| c.channel == channel || !c.versions.is_empty())?;
         if let Some(pin) = pref.pinned_version {
             cache
-                .versions
-                .iter()
+                .versions_for(channel)
                 .find(|r| r.tag_name == pin)
-                .or_else(|| cache.release.as_ref().filter(|r| r.tag_name == pin))
+                .or_else(|| cache.release_for(channel).filter(|r| r.tag_name == pin))
         } else {
-            cache.release.as_ref()
+            cache.release_for(channel)
         }
     }
     fn selected_asset<'a>(
@@ -755,7 +754,7 @@ impl Launcher {
                             if checked { self.selected_apps.insert(app.id.into()); } else { self.selected_apps.remove(app.id); }
                         }
                     }
-                    if widgets::button(ui, self.palette, if pref.favorite { "★" } else { "☆" }, ButtonKind::Quiet, !self.worker.busy(), 40.0).on_hover_text("Favorite").clicked() {
+                    if widgets::button(ui, self.palette, if pref.favorite { "★" } else { "☆" }, ButtonKind::Quiet, true, 40.0).on_hover_text("Favorite").clicked() {
                         let mut p = pref.clone(); p.favorite = !p.favorite;
                         self.command(Command::Preferences(app.id.into(), p));
                     }
@@ -868,10 +867,7 @@ impl Launcher {
                 self.command(Command::Repair(app.id.into()));
                 ui.close();
             }
-            if ui
-                .add_enabled(!self.worker.busy(), egui::Button::new("Show app folder"))
-                .clicked()
-            {
+            if ui.button("Show app folder").clicked() {
                 self.command(Command::Reveal(Some(app.id.into())));
                 ui.close();
             }
@@ -942,7 +938,7 @@ impl Launcher {
         let mut open = true;
         egui::Window::new(app.name).id(egui::Id::new("details")).open(&mut open).collapsible(false).resizable(false).default_width(660.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-130.0).max(300.0)).show(ui, |ui| {
-                if let Some(hero) = self.assets.hero(app.id) { ui.add(egui::Image::new(hero).fit_to_exact_size(Vec2::new(ui.available_width(), ui.available_width()*0.50)).corner_radius(4)); ui.add_space(12.0); }
+                if let Some(hero) = self.assets.hero(ctx, app.id) { ui.add(egui::Image::new(hero).fit_to_exact_size(Vec2::new(ui.available_width(), ui.available_width()*0.50)).corner_radius(4)); ui.add_space(12.0); }
                 ui.horizontal(|ui| { self.app_icon(ui, app.id, 54.0); ui.vertical(|ui| { ui.label(RichText::new(app.name).font(theme::display(34.0))); ui.label(RichText::new(app.category).color(self.palette.muted)); }); });
                 ui.add_space(10.0); ui.label(app.detail);
                 ui.label(RichText::new(format!("{} · Experimental software", app.stage)).color(self.palette.muted));
@@ -1005,12 +1001,13 @@ impl Launcher {
                 });
                 if changed && (before.auto_update != preferences.auto_update || before.channel != preferences.channel || before.pinned_version != preferences.pinned_version) { self.command(Command::Preferences(app.id.into(), preferences)); }
                 ui.add_space(10.0);
-                let versions = self.snapshot.state.releases.get(app.id).map(|r| r.versions.clone()).unwrap_or_default();
+                let channel = self.preferences(app.id).channel.unwrap_or(self.snapshot.state.settings.channel);
+                let versions: Vec<_> = self.snapshot.state.releases.get(app.id).into_iter().flat_map(|r| r.versions_for(channel)).cloned().collect();
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("install_version").selected_text(if self.selected_version.is_empty() { "Choose a release" } else { &self.selected_version }).show_ui(ui, |ui| { for release in &versions { ui.selectable_value(&mut self.selected_version, release.tag_name.clone(), &release.tag_name); } });
                     let can_install = !product.unavailable && !self.selected_version.is_empty() && versions.iter().find(|r| r.tag_name == self.selected_version).is_some_and(|r| self.selected_asset(app.id, r).is_some_and(|asset| craftlauncher_core::platform::supports_managed(app.id, &self.snapshot.platform, asset) && !matches!(checksum_source(r, asset), ChecksumSource::Missing))) && !self.snapshot.state.installations.get(app.id).is_some_and(|i| !i.managed) && !self.snapshot.state.pending.contains_key(app.id);
                     if self.primary(ui, "Install version", can_install) { self.command(Command::Install { id: app.id.into(), version: Some(self.selected_version.clone()) }); }
-                    if self.snapshot.state.installations.contains_key(app.id) && ui.add_enabled(!self.worker.busy(), egui::Button::new("Open app ↗")).clicked() { self.command(Command::Launch(app.id.into())); }
+                    if self.snapshot.state.installations.contains_key(app.id) && ui.button("Open app ↗").clicked() { self.command(Command::Launch(app.id.into())); }
                 });
                 if !self.available(app.id) {
                     let prefs = self.preferences(app.id);
@@ -1372,12 +1369,42 @@ impl Launcher {
         }
         let mut settings = self.snapshot.state.settings.clone();
         let mut changed = false;
+        ui.label(
+            RichText::new("APPEARANCE")
+                .monospace()
+                .size(10.0)
+                .color(self.palette.muted),
+        );
+        ui.horizontal(|ui| {
+            for (theme, label) in [
+                (Theme::Light, "Light"),
+                (Theme::Dark, "Dark"),
+                (Theme::System, "System"),
+            ] {
+                if widgets::button(
+                    ui,
+                    self.palette,
+                    label,
+                    if settings.theme == theme {
+                        ButtonKind::Primary
+                    } else {
+                        ButtonKind::Secondary
+                    },
+                    true,
+                    76.0,
+                )
+                .clicked()
+                    && settings.theme != theme
+                {
+                    settings.theme = theme;
+                    changed = true;
+                }
+            }
+        });
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(18.0);
         ui.add_enabled_ui(!self.worker.busy(), |ui| {
-            ui.label(RichText::new("APPEARANCE").monospace().size(10.0).color(self.palette.muted));
-            ui.horizontal(|ui| { for (theme, label) in [(Theme::Light, "Light"), (Theme::Dark, "Dark"), (Theme::System, "System")] {
-                if widgets::button(ui, self.palette, label, if settings.theme == theme { ButtonKind::Primary } else { ButtonKind::Secondary }, true, 76.0).clicked() && settings.theme != theme { settings.theme = theme; changed = true; }
-            } });
-            ui.add_space(18.0); ui.separator(); ui.add_space(18.0);
             ui.label(RichText::new("UPDATES").monospace().size(10.0).color(self.palette.muted));
             egui::ComboBox::from_id_salt("global_channel").selected_text(if settings.channel == Channel::Stable { "Stable releases" } else { "Preview releases" }).show_ui(ui, |ui| { changed |= ui.selectable_value(&mut settings.channel, Channel::Stable, "Stable releases").changed(); changed |= ui.selectable_value(&mut settings.channel, Channel::Preview, "Preview releases").changed(); });
             changed |= widgets::checkbox(ui, self.palette, &mut settings.check_on_startup, "Check for updates when the launcher starts", true, false).changed();
@@ -1411,13 +1438,7 @@ impl Launcher {
                 .color(self.palette.muted),
         );
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.worker.busy(),
-                    egui::Button::new("Open library folder"),
-                )
-                .clicked()
-            {
+            if ui.button("Open library folder").clicked() {
                 self.command(Command::Reveal(None));
             }
             ui.label(
@@ -1501,6 +1522,13 @@ impl Launcher {
                         self.confirm_storage = Some((app.id.clone(), version, app.rollback_bytes));
                     }
                 });
+            }
+            if report.launcher_bytes > 0 {
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "Managed launcher versions: {:.1} MB",
+                    report.launcher_bytes as f64 / 1_000_000.0
+                ));
             }
             let bytes: u64 = report.downloads.iter().map(|file| file.bytes).sum();
             ui.add_space(12.0);
