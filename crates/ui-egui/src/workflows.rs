@@ -367,7 +367,7 @@ impl Launcher {
                 ui.label("The package contains more than one application entry. Select the one to launch.");
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                     for path in &paths {
-                        if ui.add_enabled(!self.worker.busy(), egui::Button::new(path)).clicked() { selected = Some(path.clone()); }
+                        if ui.button(path).clicked() { selected = Some(path.clone()); }
                     }
                 });
                 ui.label("After saving your choice, retry the installation from the queue.");
@@ -379,13 +379,9 @@ impl Launcher {
                     &self.snapshot.arch,
                 );
                 preferences.selected_entrypoints.insert(key, path);
-                match self.worker.send(Command::Preferences(id, preferences)) {
-                    Ok(()) => {
-                        self.entrypoint_app = None;
-                        self.workflows.entrypoint_choices = None;
-                    }
-                    Err(error) => self.toast = Some((error.to_string(), true, Instant::now())),
-                }
+                self.command(Command::Preferences(id, preferences));
+                self.entrypoint_app = None;
+                self.workflows.entrypoint_choices = None;
             } else if !open {
                 self.workflows.entrypoint_choices = None;
             }
@@ -397,7 +393,7 @@ impl Launcher {
                 let mut total = 0u64;
                 for item in &preview {
                     let mut selected = self.workflows.selected_updates.contains(&item.app_id);
-                    if ui.add_enabled(!item.pinned, egui::Checkbox::new(&mut selected, format!("{} · {} → {} · {:.1} MB{}", name(&item.app_id), item.current, item.next, item.bytes as f64 / 1_000_000.0, if item.pinned { " · pinned" } else { "" }))).changed() {
+                    if ui.add_enabled(!item.pinned, egui::Checkbox::new(&mut selected, format!("{} · {} → {} · {:.1} MB{}", self.product_name(&item.app_id), item.current, item.next, item.bytes as f64 / 1_000_000.0, if item.pinned { " · pinned" } else { "" }))).changed() {
                         if selected { self.workflows.selected_updates.insert(item.app_id.clone()); } else { self.workflows.selected_updates.remove(&item.app_id); }
                     }
                     if selected && !item.pinned { total = total.saturating_add(item.bytes); }
@@ -462,7 +458,7 @@ impl Launcher {
                     .clicked()
                 {
                     if let Some(id) = self.workflows.project_app.take() {
-                        self.enqueue(Command::OpenProject {
+                        self.command(Command::OpenProject {
                             id,
                             path: path.clone(),
                         });
@@ -500,7 +496,7 @@ impl Launcher {
         if !recent.is_empty() {
             ui.collapsing("Recent projects", |ui| {
                 for project in recent {
-                    let available = project.path.is_file()
+                    let available = self.existing_recent.contains(&project.path)
                         && self
                             .snapshot
                             .state
@@ -516,7 +512,7 @@ impl Launcher {
                                     .file_name()
                                     .unwrap_or_default()
                                     .to_string_lossy(),
-                                name(&project.app_id)
+                                self.product_name(&project.app_id)
                             )),
                         )
                         .on_hover_text(project.path.display().to_string())
@@ -528,13 +524,7 @@ impl Launcher {
                         });
                     }
                 }
-                if ui
-                    .add_enabled(
-                        !self.worker.busy(),
-                        egui::Button::new("Clear recent projects"),
-                    )
-                    .clicked()
-                {
+                if ui.button("Clear recent projects").clicked() {
                     self.command(Command::ClearRecent);
                 }
             });
@@ -563,7 +553,7 @@ impl Launcher {
         }
         for app in local {
             ui.group(|ui| {
-                ui.label(name(&app.app_id));
+                ui.label(self.product_name(&app.app_id));
                 ui.label(app.executable.display().to_string());
                 if ui
                     .add_enabled(
@@ -622,11 +612,29 @@ impl Launcher {
             });
         }
     }
+    pub(crate) fn product_name(&self, id: &str) -> String {
+        self.snapshot
+            .products
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| name(id))
+    }
 }
 fn name(id: &str) -> String {
-    craftlauncher_core::app(id)
-        .map(|app| app.name.to_owned())
-        .unwrap_or_else(|_| id.to_owned())
+    if let Ok(app) = craftlauncher_core::app(id) {
+        return app.name.to_owned();
+    }
+    let lower = id.to_ascii_lowercase();
+    if let Some(prefix) = lower.strip_suffix("craft")
+        && !prefix.is_empty()
+    {
+        let mut chars = prefix.chars();
+        if let Some(first) = chars.next() {
+            return format!("{}{}Craft", first.to_ascii_uppercase(), chars.as_str());
+        }
+    }
+    id.to_owned()
 }
 
 impl Workflows {

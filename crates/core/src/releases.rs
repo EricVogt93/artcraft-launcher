@@ -69,9 +69,17 @@ pub trait Remote: Send {
 
 pub struct Github {
     client: Client,
+    async_client: reqwest::Client,
+    runtime: tokio::runtime::Runtime,
+    token: Option<String>,
 }
 impl Github {
     pub fn new() -> Result<Self> {
+        let token = ["CRAFTLAUNCHER_GITHUB_TOKEN", "GITHUB_TOKEN"]
+            .into_iter()
+            .find_map(|key| std::env::var(key).ok())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         Ok(Self {
             client: Client::builder()
                 .user_agent("CraftLauncher/0.1.0")
@@ -79,6 +87,17 @@ impl Github {
                 .timeout(Duration::from_secs(600))
                 .https_only(true)
                 .build()?,
+            async_client: reqwest::Client::builder()
+                .user_agent("CraftLauncher/0.1.0")
+                .https_only(true)
+                .connect_timeout(Duration::from_secs(15))
+                .read_timeout(Duration::from_secs(20))
+                .timeout(Duration::from_secs(600))
+                .build()?,
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?,
+            token,
         })
     }
 }
@@ -162,9 +181,12 @@ pub fn resolve_asset<'a>(
     for asset in &release.assets {
         let name = asset.name.to_ascii_lowercase().replace("x86_64", "x8664");
         let parts = tokens(&name);
-        // macOS .app.tar.gz releases have historically omitted the OS token.
+        // macOS .app.tar.gz / .app.zip releases have historically omitted the OS token.
         let os_match = parts.iter().any(|p| platforms.contains(p))
-            || (platform == "macos" && (name.ends_with(".app.tar.gz") || name.ends_with(".dmg")))
+            || (platform == "macos"
+                && (name.ends_with(".app.tar.gz")
+                    || name.ends_with(".app.zip")
+                    || name.ends_with(".dmg")))
             || (platform == "windows" && name.ends_with("-setup.exe"));
         let cpu_match = parts.iter().any(|p| cpus.contains(p))
             || (platform == "macos" && parts.contains(&"universal"));
@@ -173,11 +195,13 @@ pub fn resolve_asset<'a>(
         }
         let priority = match platform {
             "linux" if name.ends_with(".appimage") => 0,
-            "linux" | "freebsd" if name.ends_with(".tar.gz") => 1,
+            "linux" | "freebsd" if name.ends_with(".tar.gz") || name.ends_with(".tgz") => 1,
             "macos" if name.ends_with(".app.tar.gz") => 0,
             "macos" if name.ends_with(".dmg") => 1,
+            "macos" if name.ends_with(".zip") => 2,
             "windows" if name.ends_with("-portable.zip") => 0,
-            "windows" if name.ends_with("-setup.exe") => 1,
+            "windows" if name.ends_with(".zip") => 1,
+            "windows" if name.ends_with("-setup.exe") => 2,
             _ => continue,
         };
         matches.push((priority, asset));
@@ -221,7 +245,9 @@ pub fn checksum_source<'a>(release: &'a Release, asset: &'a Asset) -> ChecksumSo
     let lower = asset.name.to_ascii_lowercase();
     let stem = [
         ".app.tar.gz",
+        ".app.zip",
         ".tar.gz",
+        ".tgz",
         ".appimage",
         ".zip",
         ".dmg",
@@ -258,7 +284,13 @@ impl Remote for Github {
         Vec<crate::workspace::DiscoveredApp>,
         Vec<crate::workspace::DiscoveryPage>,
     )> {
-        discover_pages(&self.client, "https://api.github.com", cached, cancel)
+        discover_pages_with_token(
+            &self.client,
+            "https://api.github.com",
+            self.token.as_deref(),
+            cached,
+            cancel,
+        )
     }
     fn release(
         &self,
@@ -278,52 +310,14 @@ impl Remote for Github {
         channel: Channel,
         cached: Option<&ReleaseCache>,
     ) -> Result<ReleaseCache> {
-        let repository = &product.repository;
-        let mut request = self
-            .client
-            .get(format!(
-                "https://api.github.com/repos/storytold/{repository}/releases?per_page=30"
-            ))
-            .timeout(Duration::from_secs(25))
-            .header("Accept", "application/vnd.github+json");
-        if let Some(cache) = cached.filter(|c| c.channel == channel)
-            && let Some(etag) = &cache.etag
-        {
-            request = request.header(IF_NONE_MATCH, etag);
-        }
-        let response = request.send()?;
-        if response.status().as_u16() == 304 {
-            let mut cache = cached
-                .cloned()
-                .ok_or_else(|| fail("Invalid GitHub cache response."))?;
-            cache.checked_at = now();
-            cache.error = None;
-            return Ok(cache);
-        }
-        if matches!(response.status().as_u16(), 403 | 429) {
-            return Err(fail("GitHub rate limit reached. Please try again later."));
-        }
-        let response = response.error_for_status()?;
-        let etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let mut releases: Vec<Release> = response.json()?;
-        releases.retain(|r| !r.draft && (channel == Channel::Preview || !r.prerelease));
-        releases.sort_by(|a, b| {
-            crate::model::version_number(&b.tag_name)
-                .cmp(&crate::model::version_number(&a.tag_name))
-                .then_with(|| b.published_at.cmp(&a.published_at))
-        });
-        Ok(ReleaseCache {
+        fetch_release_product(
+            &self.client,
+            "https://api.github.com",
+            self.token.as_deref(),
+            &product.repository,
             channel,
-            etag,
-            checked_at: now(),
-            release: releases.first().cloned(),
-            versions: releases,
-            error: None,
-        })
+            cached,
+        )
     }
     fn checksum(&self, id: &str, asset: &Asset, release: &Release) -> Result<String> {
         self.checksum_product(
@@ -391,33 +385,94 @@ impl Remote for Github {
         if asset.size == 0 || asset.size > 2 * 1024 * 1024 * 1024 {
             return Err(fail("Invalid download size."));
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
-            let client = reqwest::Client::builder()
-                .user_agent("CraftLauncher/0.1.0")
-                .https_only(true)
-                .connect_timeout(Duration::from_secs(15))
-                .read_timeout(Duration::from_secs(20))
-                .timeout(Duration::from_secs(600))
-                .build()?;
-            download_http(
-                &client,
-                &asset.browser_download_url,
-                asset.size,
-                destination,
-                cancel,
-                progress,
-            )
-            .await
-        })
+        self.runtime.block_on(download_http(
+            &self.async_client,
+            &asset.browser_download_url,
+            asset.size,
+            destination,
+            cancel,
+            progress,
+        ))
     }
 }
 
+fn fetch_release_product(
+    client: &Client,
+    base: &str,
+    token: Option<&str>,
+    repository: &str,
+    channel: Channel,
+    cached: Option<&ReleaseCache>,
+) -> Result<ReleaseCache> {
+    let mut request = client
+        .get(format!(
+            "{base}/repos/storytold/{repository}/releases?per_page=30"
+        ))
+        .timeout(Duration::from_secs(25))
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    if let Some(cache) = cached
+        && let Some(etag) = &cache.etag
+    {
+        request = request.header(IF_NONE_MATCH, etag);
+    }
+    let response = request.send()?;
+    if response.status().as_u16() == 304 {
+        let mut cache = cached
+            .cloned()
+            .ok_or_else(|| fail("Invalid GitHub cache response."))?;
+        cache.checked_at = now();
+        cache.error = None;
+        cache.set_channel(channel);
+        return Ok(cache);
+    }
+    if matches!(response.status().as_u16(), 403 | 429) {
+        return Err(crate::Error::RateLimited);
+    }
+    let response = response.error_for_status()?;
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let mut releases: Vec<Release> = response.json()?;
+    releases.retain(|r| !r.draft);
+    releases.sort_by(|a, b| {
+        crate::model::version_number(&b.tag_name)
+            .cmp(&crate::model::version_number(&a.tag_name))
+            .then_with(|| b.published_at.cmp(&a.published_at))
+    });
+    let mut cache = ReleaseCache {
+        channel,
+        etag,
+        checked_at: now(),
+        release: None,
+        versions: releases,
+        error: None,
+    };
+    cache.set_channel(channel);
+    Ok(cache)
+}
+
+#[cfg(test)]
 fn discover_pages(
     client: &Client,
     base: &str,
+    cached: &[crate::workspace::DiscoveryPage],
+    cancel: &AtomicBool,
+) -> Result<(
+    Vec<crate::workspace::DiscoveredApp>,
+    Vec<crate::workspace::DiscoveryPage>,
+)> {
+    discover_pages_with_token(client, base, None, cached, cancel)
+}
+
+fn discover_pages_with_token(
+    client: &Client,
+    base: &str,
+    token: Option<&str>,
     cached: &[crate::workspace::DiscoveryPage],
     cancel: &AtomicBool,
 ) -> Result<(
@@ -428,7 +483,7 @@ fn discover_pages(
     let mut pages = Vec::new();
     for number in 1..=10 {
         if cancel.load(Ordering::Relaxed) {
-            return Err(fail("Discovery cancelled."));
+            return Err(crate::cancelled("Discovery cancelled."));
         }
         let previous = cached.get(number - 1);
         let mut request = client
@@ -437,6 +492,9 @@ fn discover_pages(
             ))
             .timeout(Duration::from_secs(25))
             .header("Accept", "application/vnd.github+json");
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
         if let Some(etag) = previous.and_then(|p| p.etag.as_deref()) {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -447,7 +505,7 @@ fn discover_pages(
                 .ok_or_else(|| fail("GitHub returned an invalid discovery cache response."))?
         } else {
             if matches!(response.status().as_u16(), 403 | 429) {
-                return Err(fail("GitHub rate limit reached. Please try again later."));
+                return Err(crate::Error::RateLimited);
             }
             let response = response.error_for_status()?;
             let etag = response
@@ -502,7 +560,7 @@ async fn download_http(
         request = request.header(reqwest::header::RANGE, format!("bytes={bytes}-"));
     }
     let mut response = tokio::select! {
-        _ = wait_cancel(cancel) => return Err(fail("Download cancelled.")),
+        _ = wait_cancel(cancel) => return Err(crate::cancelled("Download cancelled.")),
         response = request.send() => response?.error_for_status()?,
     };
     let append = if bytes > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -540,7 +598,7 @@ async fn download_http(
     let mut last = -1;
     loop {
         let chunk = tokio::select! {
-            _ = wait_cancel(cancel) => return Err(fail("Download cancelled.")),
+            _ = wait_cancel(cancel) => return Err(crate::cancelled("Download cancelled.")),
             chunk = response.chunk() => chunk?,
         };
         let Some(chunk) = chunk else {
@@ -575,16 +633,25 @@ struct Repository {
     fork: bool,
     archived: bool,
     disabled: bool,
+    #[serde(default)]
+    topics: Vec<String>,
 }
 fn discovery_candidates(repos: Vec<Repository>) -> Vec<crate::workspace::DiscoveredApp> {
     repos
         .into_iter()
         .filter(|repo| {
             let name = repo.name.to_ascii_lowercase();
+            let topic_match = repo.topics.iter().any(|t| {
+                matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "craft-app" | "artcraft-suite" | "craftlauncher-app"
+                )
+            });
             !repo.fork
                 && !repo.archived
                 && !repo.disabled
-                && name.ends_with("craft")
+                && !matches!(name.as_str(), "craftlauncher" | "artcraft-launcher")
+                && (name.ends_with("craft") || topic_match)
                 && repo
                     .name
                     .bytes()
@@ -807,11 +874,14 @@ mod tests {
             {"name":"oldcraft","full_name":"storytold/oldcraft","description":null,"fork":false,"archived":true,"disabled":false},
             {"name":"forkcraft","full_name":"storytold/forkcraft","description":null,"fork":true,"archived":false,"disabled":false},
             {"name":"evilcraft","full_name":"other/evilcraft","description":null,"fork":false,"archived":false,"disabled":false},
-            {"name":"craft-libs","full_name":"storytold/craft-libs","description":null,"fork":false,"archived":false,"disabled":false}
+            {"name":"craft-libs","full_name":"storytold/craft-libs","description":null,"fork":false,"archived":false,"disabled":false},
+            {"name":"craftlauncher","full_name":"storytold/craftlauncher","description":null,"fork":false,"archived":false,"disabled":false,"topics":["craft-app"]},
+            {"name":"StudioFlow","full_name":"storytold/StudioFlow","description":"Node compositor","fork":false,"archived":false,"disabled":false,"topics":["artcraft-suite"]}
         ])).unwrap();
         let candidates = discovery_candidates(repos);
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].repository, "NewCraft");
+        assert_eq!(candidates[1].repository, "StudioFlow");
     }
 
     #[test]
@@ -1001,6 +1071,24 @@ mod tests {
         );
         assert!(asset_for(&release, "freebsd", "aarch64").is_none());
         assert!(asset_for(&release, "android", "aarch64").is_none());
+
+        let tgz_and_zip = self::tests::release(&[
+            "app-linux-x86_64.tgz",
+            "app-windows-x86_64.zip",
+            "app-macos-arm64.zip",
+        ]);
+        assert_eq!(
+            asset_for(&tgz_and_zip, "linux", "x86_64").unwrap().name,
+            "app-linux-x86_64.tgz"
+        );
+        assert_eq!(
+            asset_for(&tgz_and_zip, "windows", "x86_64").unwrap().name,
+            "app-windows-x86_64.zip"
+        );
+        assert_eq!(
+            asset_for(&tgz_and_zip, "macos", "aarch64").unwrap().name,
+            "app-macos-arm64.zip"
+        );
     }
 
     #[test]
@@ -1053,5 +1141,84 @@ mod tests {
             checksum_from_manifest(&format!("{}  app.tar.gz", "G".repeat(64)), "app.tar.gz")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn release_cache_preserves_etag_across_channel_switches_and_handles_rate_limits() {
+        let body = r#"[
+            {"tag_name":"v2.0.0-rc.1","name":null,"body":null,"published_at":"2026-10-08T00:00:00Z","prerelease":true,"draft":false,"assets":[]},
+            {"tag_name":"v1.0.0","name":null,"body":null,"published_at":"2026-10-07T00:00:00Z","prerelease":false,"draft":false,"assets":[]},
+            {"tag_name":"v3.0.0","name":null,"body":null,"published_at":"2026-10-09T00:00:00Z","prerelease":false,"draft":true,"assets":[]}
+        ]"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"rel-v1\"\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let client = Client::new();
+        let (url, server) = serve_once(response);
+        let base = url.trim_end_matches("/file");
+        let stable = fetch_release_product(
+            &client,
+            base,
+            Some("test-token"),
+            "photocraft",
+            Channel::Stable,
+            None,
+        )
+        .unwrap();
+        let req = server.join().unwrap().to_ascii_lowercase();
+        assert!(req.contains("authorization: bearer test-token"));
+        assert_eq!(
+            stable.release.as_ref().map(|r| r.tag_name.as_str()),
+            Some("v1.0.0")
+        );
+        assert_eq!(
+            stable
+                .versions_for(Channel::Stable)
+                .map(|r| r.tag_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v1.0.0"]
+        );
+
+        let (url, server) = serve_once("HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n");
+        let base = url.trim_end_matches("/file");
+        let preview = fetch_release_product(
+            &client,
+            base,
+            None,
+            "photocraft",
+            Channel::Preview,
+            Some(&stable),
+        )
+        .unwrap();
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("if-none-match: \"rel-v1\"")
+        );
+        assert_eq!(preview.channel, Channel::Preview);
+        assert_eq!(
+            preview.release.as_ref().map(|r| r.tag_name.as_str()),
+            Some("v2.0.0-rc.1")
+        );
+        assert_eq!(
+            preview
+                .versions_for(Channel::Preview)
+                .map(|r| r.tag_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v2.0.0-rc.1", "v1.0.0"]
+        );
+
+        let (url, server) = serve_once(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let base = url.trim_end_matches("/file");
+        let err = fetch_release_product(&client, base, None, "photocraft", Channel::Stable, None)
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::RateLimited));
+        server.join().unwrap();
     }
 }

@@ -31,7 +31,7 @@ pub fn safe_native_relative(path: &Path) -> bool {
 }
 fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
-        Err(fail("Download cancelled."))
+        Err(crate::cancelled("Download cancelled."))
     } else {
         Ok(())
     }
@@ -512,6 +512,48 @@ pub fn resolve_entrypoint(
                 }
             }
         }
+        if matches.len() > 1 {
+            let non_resource: BTreeSet<PathBuf> = matches
+                .iter()
+                .filter(|path| {
+                    !path.components().any(|c| {
+                        c.as_os_str().to_str().is_some_and(|part| {
+                            matches!(
+                                part.to_ascii_lowercase().as_str(),
+                                "share"
+                                    | "doc"
+                                    | "docs"
+                                    | "man"
+                                    | "completions"
+                                    | "icons"
+                                    | "locale"
+                                    | "licenses"
+                            )
+                        })
+                    })
+                })
+                .cloned()
+                .collect();
+            if !non_resource.is_empty() {
+                matches = non_resource;
+            }
+        }
+        #[cfg(unix)]
+        if matches.len() > 1 {
+            use std::os::unix::fs::PermissionsExt;
+            let executable_only: BTreeSet<PathBuf> = matches
+                .iter()
+                .filter(|path| {
+                    root.join(path)
+                        .metadata()
+                        .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                })
+                .cloned()
+                .collect();
+            if !executable_only.is_empty() {
+                matches = executable_only;
+            }
+        }
     }
     match matches.len() {
         0 => Err(fail("The release has no identifiable application entry.")),
@@ -590,5 +632,27 @@ mod entrypoint_tests {
                 .to_string()
                 .contains("Multiple")
         );
+    }
+    #[test]
+    fn resource_directories_and_non_executables_do_not_shadow_real_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bin")).unwrap();
+        fs::create_dir_all(tmp.path().join("share/doc")).unwrap();
+        fs::write(tmp.path().join("bin/newcraft"), b"binary").unwrap();
+        fs::write(tmp.path().join("share/doc/newcraft"), b"readme").unwrap();
+        assert_eq!(
+            resolve_entrypoint(tmp.path(), &["newcraft"], None, false).unwrap(),
+            tmp.path().join("bin/newcraft")
+        );
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(tmp.path().join("etc")).unwrap();
+            fs::write(tmp.path().join("etc/newcraft"), b"config").unwrap();
+            make_executable(&tmp.path().join("bin/newcraft")).unwrap();
+            assert_eq!(
+                resolve_entrypoint(tmp.path(), &["newcraft"], None, false).unwrap(),
+                tmp.path().join("bin/newcraft")
+            );
+        }
     }
 }

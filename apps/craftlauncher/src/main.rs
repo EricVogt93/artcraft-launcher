@@ -197,11 +197,7 @@ fn run(args: Args) -> Result<()> {
         || args.register_launcher;
     let mut manager = match Manager::open(root.clone()) {
         Ok(manager) => manager,
-        Err(error)
-            if error.to_string().contains("already using this library")
-                && !cli
-                && args.update_health.is_none() =>
-        {
+        Err(craftlauncher_core::Error::LibraryLocked) if !cli && args.update_health.is_none() => {
             fs::write(root.join("bring-to-front"), b"show")?;
             return Ok(());
         }
@@ -407,6 +403,7 @@ fn run(args: Args) -> Result<()> {
         }
     }
     if cli {
+        let _ = fs::remove_file(root.join("bring-to-front"));
         println!("{}", serde_json::to_string_pretty(&manager.snapshot())?);
         return Ok(());
     }

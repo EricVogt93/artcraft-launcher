@@ -258,6 +258,114 @@ impl From<App> for Product {
     }
 }
 
+fn format_craft_name(repo: &str) -> String {
+    if repo.bytes().any(|b| b.is_ascii_uppercase()) {
+        return repo.to_string();
+    }
+    let lower = repo.to_ascii_lowercase();
+    if let Some(prefix) = lower.strip_suffix("craft")
+        && !prefix.is_empty()
+    {
+        let mut chars = prefix.chars();
+        if let Some(first) = chars.next() {
+            return format!("{}{}Craft", first.to_ascii_uppercase(), chars.as_str());
+        }
+    }
+    repo.to_string()
+}
+
+fn infer_metadata(
+    repo: &str,
+    description: &str,
+) -> (&'static str, &'static str, [u8; 3], Vec<String>) {
+    let text = format!(
+        "{} {}",
+        repo.to_ascii_lowercase(),
+        description.to_ascii_lowercase()
+    );
+    let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+    if has(&["audio", "music", "sound", "synth", "daw", "midi"]) {
+        (
+            "Audio production",
+            "Audio production",
+            [90, 170, 170],
+            vec!["Audio".into(), "Music".into(), "Craft".into()],
+        )
+    } else if has(&["video", "film", "vfx", "motion", "animation", "2d"]) {
+        (
+            "Video & animation",
+            "Video & animation",
+            [134, 98, 222],
+            vec!["Video".into(), "Animation".into(), "Craft".into()],
+        )
+    } else if has(&["cad", "drafting", "parametric", "mesh"]) {
+        (
+            "CAD & drafting",
+            "CAD & drafting",
+            [66, 160, 210],
+            vec!["CAD".into(), "Drafting".into(), "Craft".into()],
+        )
+    } else if has(&["3d", "shader", "render", "ai ", "neural", "generative"]) {
+        (
+            "AI & 3D",
+            "3D & AI",
+            [45, 129, 255],
+            vec!["3D".into(), "AI".into(), "Craft".into()],
+        )
+    } else if has(&[
+        "photo",
+        "image",
+        "vector",
+        "raw",
+        "illustration",
+        "pixel",
+        "paint",
+    ]) {
+        (
+            "Photography & illustration",
+            "Illustration & image",
+            [52, 122, 236],
+            vec!["Graphics".into(), "Illustration".into(), "Craft".into()],
+        )
+    } else if has(&["ui ", "interface", "prototype", "wireframe"]) {
+        (
+            "Interface design",
+            "Interface design",
+            [172, 112, 218],
+            vec!["UI design".into(), "Prototyping".into(), "Craft".into()],
+        )
+    } else if has(&["pdf", "publish", "layout", "print", "book", "font", "type"]) {
+        (
+            "PDF & publishing",
+            "Publishing",
+            [208, 113, 160],
+            vec!["Publishing".into(), "Documents".into(), "Craft".into()],
+        )
+    } else if has(&[
+        "spreadsheet",
+        "word",
+        "slide",
+        "deck",
+        "office",
+        "note",
+        "table",
+    ]) {
+        (
+            "Office & productivity",
+            "Productivity",
+            [75, 167, 112],
+            vec!["Productivity".into(), "Documents".into(), "Craft".into()],
+        )
+    } else {
+        (
+            "Other Craft apps",
+            "Craft app",
+            [45, 129, 255],
+            vec!["Craft".into()],
+        )
+    }
+}
+
 /// Construct an owned catalog from built-ins and the last successful scan.
 /// Reject unsafe identifiers and collisions before these values can become paths.
 pub fn products(discovered: &[crate::workspace::DiscoveredApp]) -> Vec<Product> {
@@ -284,16 +392,17 @@ pub fn products(discovered: &[crate::workspace::DiscoveredApp]) -> Vec<Product> 
         {
             continue;
         }
+        let (discipline, category, color, tags) = infer_metadata(&app.repository, &app.description);
         products.push(Product {
             id: id.clone(),
             repository: app.repository.clone(),
-            name: app.repository.clone(),
-            category: "Craft app".into(),
-            discipline: "Other Craft apps".into(),
+            name: format_craft_name(&app.repository),
+            category: category.into(),
+            discipline: discipline.into(),
             description: app.description.clone(),
             detail: app.description.clone(),
-            color: [45, 129, 255],
-            tags: vec!["Craft".into()],
+            color,
+            tags,
             stage: if app.unavailable {
                 "Unavailable"
             } else {
@@ -340,5 +449,16 @@ mod product_tests {
         let pdf = products.iter().find(|p| p.id == "printcraft").unwrap();
         assert_eq!(pdf.repository, "pdfcraft");
         assert!(!pdf.discovered);
+
+        let inferred = super::products(&[DiscoveredApp {
+            app_id: "synthcraft".into(),
+            github_id: Some(99),
+            unavailable: false,
+            repository: "synthcraft".into(),
+            description: "Modular audio synthesizer and MIDI studio".into(),
+        }]);
+        let synth = inferred.iter().find(|p| p.id == "synthcraft").unwrap();
+        assert_eq!(synth.name, "SynthCraft");
+        assert_eq!(synth.discipline, "Audio production");
     }
 }

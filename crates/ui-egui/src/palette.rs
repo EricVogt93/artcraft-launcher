@@ -56,7 +56,7 @@ impl Launcher {
             }
         }
         for recent in &self.snapshot.state.recent_projects {
-            if !recent.path.is_file()
+            if !self.existing_recent.contains(&recent.path)
                 || !self
                     .snapshot
                     .state

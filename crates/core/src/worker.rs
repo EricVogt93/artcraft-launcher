@@ -58,6 +58,20 @@ pub enum Command {
     ActivatePending,
     Shutdown,
 }
+impl Command {
+    pub fn is_fast(&self) -> bool {
+        matches!(
+            self,
+            Self::Launch(_)
+                | Self::OpenProject { .. }
+                | Self::Reveal(_)
+                | Self::ClearRecent
+                | Self::Discard(_)
+                | Self::Configure(_)
+                | Self::Preferences(_, _)
+        )
+    }
+}
 #[derive(Debug)]
 pub enum Event {
     State(Box<Snapshot>),
@@ -74,6 +88,17 @@ pub enum Event {
         result: std::result::Result<String, String>,
     },
 }
+struct EventSender {
+    send: Sender<Event>,
+    waker: Arc<dyn Fn() + Send + Sync>,
+}
+impl EventSender {
+    fn send(&self, event: Event) {
+        if self.send.send(event).is_ok() {
+            (self.waker)();
+        }
+    }
+}
 pub struct Worker {
     pub events: Receiver<Event>,
     commands: Sender<Command>,
@@ -83,18 +108,26 @@ pub struct Worker {
 }
 impl Worker {
     pub fn new(manager: Manager, launcher: PathBuf) -> Self {
+        Self::with_waker(manager, launcher, Arc::new(|| {}))
+    }
+    pub fn with_waker(
+        manager: Manager,
+        launcher: PathBuf,
+        waker: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
         let (commands, received) = mpsc::channel();
         let (send, events) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let busy = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_busy = busy.clone();
+        let sender = EventSender { send, waker };
         let thread = thread::spawn(move || {
             run(
                 manager,
                 launcher,
                 received,
-                send,
+                sender,
                 worker_cancel,
                 worker_busy,
             )
@@ -108,6 +141,12 @@ impl Worker {
         }
     }
     pub fn send(&self, command: Command) -> Result<()> {
+        if command.is_fast() {
+            if self.commands.send(command).is_err() {
+                return Err(fail("The background service has stopped."));
+            }
+            return Ok(());
+        }
         if self
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -142,7 +181,7 @@ fn run(
     mut manager: Manager,
     launcher: PathBuf,
     commands: Receiver<Command>,
-    send: Sender<Event>,
+    send: EventSender,
     cancel: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
 ) {
@@ -152,12 +191,12 @@ fn run(
         Instant::now() + Duration::from_secs(6 * 3600)
     };
     let mut next_activation = Instant::now() + Duration::from_secs(15);
-    let _ = send.send(Event::State(Box::new(manager.snapshot())));
+    send.send(Event::State(Box::new(manager.snapshot())));
     let local = crate::workspace::discover_local(
         &crate::workspace::local_search_roots(),
         &manager.snapshot(),
     );
-    let _ = send.send(Event::LocalApps(local));
+    send.send(Event::LocalApps(local));
     loop {
         let command = match commands.recv_timeout(Duration::from_secs(1)) {
             Ok(Command::Shutdown) => break,
@@ -166,6 +205,7 @@ fn run(
             Err(mpsc::RecvTimeoutError::Timeout) => None,
         };
         if let Some(command) = command {
+            let fast = command.is_fast();
             let (command, task_id, task_key, checkpoint) = match command {
                 Command::Queued {
                     id,
@@ -203,10 +243,10 @@ fn run(
                 manager.queue_owner = None;
                 result
             };
-            let _ = send.send(Event::State(Box::new(manager.snapshot())));
+            send.send(Event::State(Box::new(manager.snapshot())));
             if let (Err(crate::Error::Entrypoints(paths)), Some(app_id)) = (&result, app_for_choice)
             {
-                let _ = send.send(Event::Entrypoints {
+                send.send(Event::Entrypoints {
                     app_id,
                     paths: paths.clone(),
                 });
@@ -216,8 +256,10 @@ fn run(
                 Some(id) => Event::TaskFinished { id, result },
                 None => Event::Finished(result),
             };
-            let _ = send.send(event);
-            busy.store(false, Ordering::Release);
+            send.send(event);
+            if !fast {
+                busy.store(false, Ordering::Release);
+            }
             // An explicit refresh satisfies the periodic check too.
             if refresh {
                 next_check = Instant::now() + Duration::from_secs(6 * 3600);
@@ -233,15 +275,15 @@ fn run(
                 None,
             );
             if let Err(e) = result {
-                let _ = send.send(Event::Finished(Err(e.to_string())));
+                send.send(Event::Finished(Err(e.to_string())));
             }
-            let _ = send.send(Event::State(Box::new(manager.snapshot())));
+            send.send(Event::State(Box::new(manager.snapshot())));
             busy.store(false, Ordering::Release);
             next_check = Instant::now() + Duration::from_secs(6 * 3600);
         } else if Instant::now() >= next_activation && !busy.swap(true, Ordering::AcqRel) {
             let _ = manager.reconcile_launcher_update();
             let _ = manager.activate_all_pending();
-            let _ = send.send(Event::State(Box::new(manager.snapshot())));
+            send.send(Event::State(Box::new(manager.snapshot())));
             busy.store(false, Ordering::Release);
             next_activation = Instant::now() + Duration::from_secs(15);
         }
@@ -310,14 +352,14 @@ fn execute(
     command: Command,
     launcher: &std::path::Path,
     cancel: &AtomicBool,
-    send: &Sender<Event>,
+    send: &EventSender,
     checkpoint: Option<&crate::queue::QueueCheckpoint>,
 ) -> Result<String> {
     let mut progress = |p| {
-        let _ = send.send(Event::Progress(p));
+        send.send(Event::Progress(p));
     };
     let mut changed = |s| {
-        let _ = send.send(Event::State(Box::new(s)));
+        send.send(Event::State(Box::new(s)));
     };
     match command {
         Command::DownloadSelected { ids, folder } => {
@@ -383,7 +425,7 @@ fn execute(
                 &manager.snapshot(),
             );
             let count = apps.len();
-            let _ = send.send(Event::LocalApps(apps));
+            send.send(Event::LocalApps(apps));
             Ok(format!("Found {count} local installations."))
         }
         Command::OpenProject { id, path } => {
@@ -413,7 +455,14 @@ fn execute(
         Command::Configure(settings) => {
             let changed_channel = settings.channel != manager.state.settings.channel;
             manager.configure(settings, launcher)?;
-            if changed_channel {
+            if changed_channel
+                && (manager.state.releases.is_empty()
+                    || manager
+                        .state
+                        .releases
+                        .values()
+                        .any(|c| c.versions.is_empty()))
+            {
                 manager.refresh_all(cancel, &mut changed)?;
             }
             Ok("Settings saved.".into())
@@ -421,24 +470,30 @@ fn execute(
         Command::Preferences(id, preferences) => {
             let changed_channel = preferences.channel != manager.preferences(&id).channel;
             manager.set_preferences(&id, preferences)?;
-            if changed_channel {
+            if changed_channel
+                && !manager
+                    .state
+                    .releases
+                    .get(&id)
+                    .is_some_and(|c| !c.versions.is_empty())
+            {
                 manager.refresh_app(&id)?;
             }
             Ok("App preferences saved.".into())
         }
         Command::ScanStorage => {
             let report = manager.storage_report()?;
-            let _ = send.send(Event::Storage(report));
+            send.send(Event::Storage(report));
             Ok("Storage scan complete.".into())
         }
         Command::RemoveCachedDownloads(names) => {
             let count = manager.remove_cached_downloads(&names)?;
-            let _ = send.send(Event::Storage(manager.storage_report()?));
+            send.send(Event::Storage(manager.storage_report()?));
             Ok(format!("Removed {count} cached downloads."))
         }
         Command::RemoveRollback { id, version } => {
             manager.remove_rollback(&id, &version)?;
-            let _ = send.send(Event::Storage(manager.storage_report()?));
+            send.send(Event::Storage(manager.storage_report()?));
             Ok("Previous version removed.".into())
         }
         Command::Reveal(id) => {
