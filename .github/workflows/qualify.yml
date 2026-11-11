@@ -72,7 +72,7 @@ jobs:
         run: python scripts/qualify_updates.py --target ${{ matrix.rust }}
       - name: Package Linux and Windows distributions
         if: runner.os != 'macOS'
-        run: python scripts/package.py --binaries target/${{ matrix.rust }}/release --output .tmp/packages --version 0.2.0 --target ${{ matrix.platform }} --native-installer
+        run: python scripts/package.py --binaries target/${{ matrix.rust }}/release --output .tmp/packages --version 0.3.0 --target ${{ matrix.platform }} --native-installer
       - name: Verify Linux package installation
         if: runner.os == 'Linux'
         run: |
@@ -108,8 +108,8 @@ jobs:
             lipo -create target/aarch64-apple-darwin/release/$binary target/x86_64-apple-darwin/release/$binary -output .tmp/universal/$binary
             lipo .tmp/universal/$binary -verify_arch x86_64 arm64
           done
-          python3 scripts/package.py --binaries .tmp/universal --output .tmp/packages --version 0.2.0 --target macos-universal --native-installer
-          tar -xzf .tmp/packages/craftlauncher-0.2.0-macos-universal.tar.gz -C .tmp/universal
+          python3 scripts/package.py --binaries .tmp/universal --output .tmp/packages --version 0.3.0 --target macos-universal --native-installer
+          tar -xzf .tmp/packages/craftlauncher-0.3.0-macos-universal.tar.gz -C .tmp/universal
           python3 scripts/native_smoke.py --binary .tmp/universal/CraftLauncher.app/Contents/MacOS/craftlauncher
       - uses: actions/upload-artifact@v4
         if: matrix.platform != 'macos-x86_64'
@@ -136,7 +136,7 @@ jobs:
             sleep 2
             dbus-run-session -- env DISPLAY=:99 python3.11 scripts/native_smoke.py --binary target/release/craftlauncher
             dbus-run-session -- env DISPLAY=:99 python3.11 scripts/qualify_updates.py
-            python3.11 scripts/package.py --binaries target/release --output .tmp/packages --version 0.2.0 --target freebsd-x86_64
+            python3.11 scripts/package.py --binaries target/release --output .tmp/packages --version 0.3.0 --target freebsd-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: craftlauncher-freebsd-x86_64

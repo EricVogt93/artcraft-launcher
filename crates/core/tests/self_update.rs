@@ -159,7 +159,10 @@ fn tampered_payload_is_rejected_even_if_local_state_hash_is_changed() {
     )
     .unwrap()
     .unwrap();
-    assert!(self_update::verify_prepared(tmp.path(), &prepared, &key).is_ok());
+    let trust = self_update::UpdateTrust::Signed {
+        public_key: key.clone(),
+    };
+    assert!(self_update::verify_prepared(tmp.path(), &prepared, &trust).is_ok());
     fs::write(tmp.path().join(&prepared.helper), b"changed").unwrap();
     prepared.helper_sha256 = self_update::hash_file(&tmp.path().join(&prepared.helper)).unwrap();
     assert!(
@@ -167,7 +170,7 @@ fn tampered_payload_is_rejected_even_if_local_state_hash_is_changed() {
             tmp.path(),
             &prepared,
             &std::env::current_exe().unwrap(),
-            &key,
+            &trust,
             1
         )
         .is_err()
@@ -212,7 +215,7 @@ fn run_job(payload: &[u8], expected_success: bool) {
             version: "1.0.0".into(),
             executable: previous.clone(),
         },
-        public_key: key,
+        trust: self_update::UpdateTrust::Signed { public_key: key },
         timeout_seconds: 1,
     };
     atomic_json(&library.join("launcher/update-job.json"), &job).unwrap();
@@ -320,7 +323,7 @@ fn helper_integrity_failure_restores_the_old_process_and_bootstrap() {
             version: "1.0.0".into(),
             executable: previous.clone(),
         },
-        public_key: key,
+        trust: self_update::UpdateTrust::Signed { public_key: key },
         timeout_seconds: 1,
     };
     atomic_json(&library.join("launcher/update-job.json"), &job).unwrap();
@@ -417,4 +420,97 @@ fn reconcile_cleans_obsolete_launcher_versions_and_staging_while_keeping_active(
     assert!(!library.join(&v1.directory).exists());
     assert!(library.join(&v2.directory).is_dir());
     assert!(manager.storage_report().unwrap().launcher_bytes > 0);
+}
+
+fn unsigned_archive(root: &Path, version: &str) -> (std::path::PathBuf, Vec<u8>) {
+    let archive = root.join("launcher.tar.gz");
+    let mut tar = tar::Builder::new(GzEncoder::new(
+        fs::File::create(&archive).unwrap(),
+        Compression::fast(),
+    ));
+    for (name, bytes) in [
+        ("craftlauncher", b"#!/bin/sh\nexit 0\n".as_slice()),
+        ("craftlauncher-updater", b"#!/bin/sh\nexit 0\n".as_slice()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, name, bytes).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap();
+    let manifest = UpdateManifest {
+        schema: 1,
+        version: version.into(),
+        channel: Channel::Stable,
+        target: self_update::target_id(),
+        archive: "launcher.tar.gz".into(),
+        sha256: self_update::hash_file(&archive).unwrap(),
+        bytes: archive.metadata().unwrap().len(),
+        executable: "craftlauncher".into(),
+        helper: "craftlauncher-updater".into(),
+    };
+    (archive, serde_json::to_vec(&manifest).unwrap())
+}
+
+#[test]
+fn downloaded_github_update_prepares_and_verifies_without_signature() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (archive, bytes) = unsigned_archive(tmp.path(), "1.1.0");
+    let prepared = self_update::prepare_downloaded(
+        tmp.path(),
+        &archive,
+        &bytes,
+        Channel::Stable,
+        "1.0.0",
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        !archive.exists(),
+        "the downloaded archive is moved into staging"
+    );
+    let trust = self_update::UpdateTrust::Github;
+    self_update::verify_prepared(tmp.path(), &prepared, &trust).unwrap();
+    // A forged signature must not silently upgrade an unsigned GitHub update.
+    fs::write(
+        tmp.path()
+            .join(&prepared.directory)
+            .join("manifest.json.sig"),
+        "00".repeat(64),
+    )
+    .unwrap();
+    assert!(self_update::verify_prepared(tmp.path(), &prepared, &trust).is_err());
+}
+
+#[test]
+fn downloaded_update_rejects_stale_versions_and_corrupt_archives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (archive, bytes) = unsigned_archive(tmp.path(), "1.0.0");
+    assert!(
+        self_update::prepare_downloaded(
+            tmp.path(),
+            &archive,
+            &bytes,
+            Channel::Stable,
+            "1.0.0",
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .is_none()
+    );
+    let mut file = fs::OpenOptions::new().append(true).open(&archive).unwrap();
+    file.write_all(b"corrupt").unwrap();
+    assert!(
+        self_update::prepare_downloaded(
+            tmp.path(),
+            &archive,
+            &bytes,
+            Channel::Stable,
+            "0.9.0",
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
 }

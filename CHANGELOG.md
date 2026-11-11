@@ -2,6 +2,10 @@
 
 This changelog describes the launcher only. Changes to third-party apps are published by their own developers.
 
+## 0.3.0 — 2026-11-11
+
+- Update the launcher itself from the official GitHub releases: checksum-verified downloads over HTTPS, enabled by default, with the existing helper, first-frame health check and automatic rollback. A configured local signed feed keeps priority.
+
 ## 0.2.0 — 2026-11-11
 
 - Discover and manage new public Storytold Craft repositories from a cached dynamic catalog, with safe package and application-entry selection.

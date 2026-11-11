@@ -505,7 +505,7 @@ fn execute(
             Ok(if manager.state.launcher_update.is_some() {
                 "Launcher update verified. Restart to activate.".into()
             } else {
-                "Launcher is up to date, or no local feed is configured.".into()
+                "Launcher is up to date, or no update feed is configured.".into()
             })
         }
         Command::ActivatePending => {

@@ -1,5 +1,6 @@
-//! Local, signed self-update feed. A separate helper switches a version pointer only
-//! after the launcher releases its library lock, and waits for a first-frame health ack.
+//! Signed local or official GitHub self-update feeds. A separate helper switches a
+//! version pointer only after the launcher releases its library lock, and waits for a
+//! first-frame health ack.
 use crate::{
     Result, fail,
     installer::{extract_tar, extract_zip, make_executable, safe_native_relative, safe_relative},
@@ -56,7 +57,7 @@ pub struct BootPointer {
 pub struct UpdateJob {
     pub prepared: PreparedUpdate,
     pub previous: BootPointer,
-    pub public_key: String,
+    pub trust: UpdateTrust,
     pub timeout_seconds: u64,
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,6 +65,15 @@ pub struct UpdateReport {
     pub version: String,
     pub success: bool,
     pub restored: Option<String>,
+}
+
+/// How a prepared update is authenticated. Local feeds require an Ed25519 signature;
+/// the official GitHub feed trusts HTTPS transport plus the release checksums.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateTrust {
+    Signed { public_key: String },
+    Github,
 }
 
 pub fn hash_file(path: &Path) -> Result<String> {
@@ -96,6 +106,16 @@ pub fn verify_manifest(
     .map_err(|_| fail("Invalid update signature."))?;
     key.verify_strict(bytes, &signature)
         .map_err(|_| fail("The launcher update signature is invalid."))?;
+    validate_manifest_bytes(bytes)
+}
+
+/// Parse and validate manifest structure without a signature. Only the official
+/// GitHub feed uses this; its archives are bound by HTTPS and SHA-256 instead.
+pub fn parse_manifest(bytes: &[u8]) -> Result<UpdateManifest> {
+    validate_manifest_bytes(bytes)
+}
+
+fn validate_manifest_bytes(bytes: &[u8]) -> Result<UpdateManifest> {
     let manifest: UpdateManifest = serde_json::from_slice(bytes)?;
     if manifest.schema != MANIFEST_SCHEMA
         || crate::model::version_number(&manifest.version).is_none()
@@ -184,12 +204,81 @@ pub fn prepare(
     if hash_file(&archive)? != manifest.sha256.to_ascii_lowercase() {
         return Err(fail("Launcher archive changed while preparing the update."));
     }
+    finish_prepared(
+        &parent,
+        stage,
+        &archive,
+        &manifest,
+        &bytes,
+        Some(&signature),
+        cancel,
+    )
+}
+
+/// Prepare an update from an archive downloaded over HTTPS from the official
+/// GitHub release. The manifest is unsigned; integrity comes from the release
+/// checksums verified during download and re-verified here.
+pub fn prepare_downloaded(
+    root: &Path,
+    archive: &Path,
+    manifest_bytes: &[u8],
+    channel: Channel,
+    current_version: &str,
+    cancel: &AtomicBool,
+) -> Result<Option<PreparedUpdate>> {
+    let manifest = parse_manifest(manifest_bytes)?;
+    if manifest.channel != channel {
+        return Err(fail(
+            "The update feed channel does not match the selected channel.",
+        ));
+    }
+    if !is_newer(&manifest.version, current_version) {
+        return Ok(None);
+    }
+    if archive.metadata()?.len() != manifest.bytes {
+        return Err(fail(
+            "The update archive is missing or has an invalid size.",
+        ));
+    }
+    if hash_file(archive)? != manifest.sha256.to_ascii_lowercase() {
+        return Err(fail("Launcher archive checksum mismatch."));
+    }
+    let parent = root.join("launcher/versions");
+    fs::create_dir_all(&parent)?;
+    let stage = tempfile::Builder::new()
+        .prefix(".staging-")
+        .tempdir_in(&parent)?;
+    let staged = stage.path().join("archive");
+    fs::rename(archive, &staged)?;
+    if hash_file(&staged)? != manifest.sha256.to_ascii_lowercase() {
+        return Err(fail("Launcher archive changed while preparing the update."));
+    }
+    finish_prepared(
+        &parent,
+        stage,
+        &staged,
+        &manifest,
+        manifest_bytes,
+        None,
+        cancel,
+    )
+}
+
+fn finish_prepared(
+    parent: &Path,
+    stage: tempfile::TempDir,
+    archive: &Path,
+    manifest: &UpdateManifest,
+    manifest_bytes: &[u8],
+    signature: Option<&str>,
+    cancel: &AtomicBool,
+) -> Result<Option<PreparedUpdate>> {
     let payload = stage.path().join("payload");
     fs::create_dir(&payload)?;
     if manifest.archive.ends_with(".tar.gz") {
-        extract_tar(&archive, &payload, cancel, cfg!(target_os = "macos"))?;
+        extract_tar(archive, &payload, cancel, cfg!(target_os = "macos"))?;
     } else if manifest.archive.ends_with(".zip") {
-        extract_zip(&archive, &payload, cancel, cfg!(target_os = "macos"))?;
+        extract_zip(archive, &payload, cancel, cfg!(target_os = "macos"))?;
     } else {
         return Err(fail("Unsupported launcher update archive format."));
     }
@@ -204,16 +293,18 @@ pub fn prepare(
     make_executable(&helper)?;
     let executable_sha256 = hash_file(&executable)?;
     let helper_sha256 = hash_file(&helper)?;
-    fs::write(stage.path().join("manifest.json"), &bytes)?;
-    fs::write(stage.path().join("manifest.json.sig"), signature)?;
+    fs::write(stage.path().join("manifest.json"), manifest_bytes)?;
+    if let Some(signature) = signature {
+        fs::write(stage.path().join("manifest.json.sig"), signature)?;
+    }
     let token = uuid::Uuid::new_v4().to_string();
     let destination = parent.join(&token);
     fs::rename(stage.path(), &destination)?;
     let directory = PathBuf::from("launcher/versions").join(token);
     Ok(Some(PreparedUpdate {
-        version: manifest.version,
-        executable: directory.join("payload").join(manifest.executable),
-        helper: directory.join("payload").join(manifest.helper),
+        version: manifest.version.clone(),
+        executable: directory.join("payload").join(&manifest.executable),
+        helper: directory.join("payload").join(&manifest.helper),
         directory,
         executable_sha256,
         helper_sha256,
@@ -233,10 +324,10 @@ pub fn start_helper(
     root: &Path,
     prepared: &PreparedUpdate,
     previous_executable: &Path,
-    public_key: &str,
+    trust: &UpdateTrust,
     timeout_seconds: u64,
 ) -> Result<()> {
-    verify_prepared(root, prepared, public_key)?;
+    verify_prepared(root, prepared, trust)?;
     let helper = within(root, &prepared.helper)?;
     if hash_file(&helper)? != prepared.helper_sha256 {
         return Err(fail("The update helper checksum has changed."));
@@ -248,7 +339,7 @@ pub fn start_helper(
     let job = UpdateJob {
         prepared: prepared.clone(),
         previous,
-        public_key: public_key.into(),
+        trust: trust.clone(),
         timeout_seconds: timeout_seconds.clamp(1, 120),
     };
     let job_file = root.join("launcher/update-job.json");
@@ -267,19 +358,28 @@ pub fn start_helper(
     Ok(())
 }
 
-/// Bind extracted executables to the signed archive, even if local state was modified.
+/// Bind extracted executables to the trusted archive, even if local state was modified.
 pub fn verify_prepared(
     root: &Path,
     prepared: &PreparedUpdate,
-    public_key: &str,
+    trust: &UpdateTrust,
 ) -> Result<UpdateManifest> {
     let directory = within(root, &prepared.directory)?;
-    let manifest = verify_manifest(
-        &limited_text(&directory.join("manifest.json"))?,
-        &String::from_utf8(limited_text(&directory.join("manifest.json.sig"))?)
-            .map_err(|_| fail("Invalid signature."))?,
-        public_key,
-    )?;
+    let bytes = limited_text(&directory.join("manifest.json"))?;
+    let manifest = match trust {
+        UpdateTrust::Signed { public_key } => verify_manifest(
+            &bytes,
+            &String::from_utf8(limited_text(&directory.join("manifest.json.sig"))?)
+                .map_err(|_| fail("Invalid signature."))?,
+            public_key,
+        )?,
+        UpdateTrust::Github => {
+            if directory.join("manifest.json.sig").exists() {
+                return Err(fail("Unexpected signature on a GitHub feed update."));
+            }
+            parse_manifest(&bytes)?
+        }
+    };
     if manifest.version != prepared.version
         || prepared.executable
             != prepared
@@ -363,7 +463,7 @@ fn apply_verified_job(root: &Path) -> Result<bool> {
     let job: UpdateJob =
         serde_json::from_slice(&limited_text(&root.join("launcher/update-job.json"))?)?;
     let executable = within(&root, &job.prepared.executable)?;
-    verify_prepared(&root, &job.prepared, &job.public_key)?;
+    verify_prepared(&root, &job.prepared, &job.trust)?;
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
