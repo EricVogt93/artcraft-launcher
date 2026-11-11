@@ -1146,6 +1146,33 @@ impl Launcher {
                     {
                         self.command(Command::CheckLauncher);
                     }
+                } else if self.snapshot.state.settings.github_update_feed {
+                    ui.label(
+                        RichText::new("Official GitHub release feed enabled.")
+                            .color(self.palette.muted),
+                    );
+                    if let Some(error) = self
+                        .snapshot
+                        .state
+                        .launcher_release
+                        .as_ref()
+                        .and_then(|cache| cache.error.as_deref())
+                    {
+                        ui.label(
+                            RichText::new(format!("Last check failed: {error}"))
+                                .size(11.0)
+                                .color(self.palette.muted),
+                        );
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.worker.busy(),
+                            egui::Button::new("Check launcher update"),
+                        )
+                        .clicked()
+                    {
+                        self.command(Command::CheckLauncher);
+                    }
                 } else {
                     ui.label(
                         RichText::new("Local build · no launcher update feed configured yet.")
@@ -1448,6 +1475,19 @@ impl Launcher {
                 .size(11.0)
                 .color(self.palette.muted),
             );
+        });
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(18.0);
+        ui.collapsing("GitHub launcher updates", |ui| {
+            ui.label(RichText::new("Check the official EricVogt93/artcraft-launcher GitHub releases for new launcher versions. Downloads are verified against the published SHA-256 checksums; no signing key is required. A configured local signed feed takes priority.").size(12.0).color(self.palette.muted));
+            let mut github_feed = self.snapshot.state.settings.github_update_feed;
+            if widgets::checkbox(ui, self.palette, &mut github_feed, "Check GitHub releases for launcher updates", true, false).changed() {
+                let mut settings = self.snapshot.state.settings.clone();
+                settings.github_update_feed = github_feed;
+                self.command(Command::Configure(settings));
+            }
+            if ui.add_enabled(!self.worker.busy(), egui::Button::new("Check GitHub update")).clicked() { self.command(Command::CheckLauncher); }
         });
         ui.add_space(18.0);
         ui.separator();

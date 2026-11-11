@@ -53,7 +53,7 @@ cargo build --locked --release --bins
 - Automatic checks at startup and every six hours; verified app updates activate when the app closes. Downloads can be cancelled without replacing the installed version.
 - Native tray, login startup, desktop notifications, Light/Dark/System themes and single-instance foreground activation.
 - Settings tabs for general preferences, the launcher changelog and an explicit developer/project independence statement.
-- A **local, signed launcher update feed**, separate update helper, stable bootstrap entry point, first-frame health acknowledgement and automatic recovery if the new launcher fails to start. A failed version is quarantined from automatic retries; an explicit manual check can retry it.
+- Launcher self-updates from the **official GitHub releases** (checksum-verified over HTTPS, enabled by default) or a **local, signed update feed**, with a separate update helper, stable bootstrap entry point, first-frame health acknowledgement and automatic recovery if the new launcher fails to start. A failed version is quarantined from automatic retries; an explicit manual check can retry it.
 - Atomic JSON persistence, exclusive library locking, preservation of damaged-state files and cleanup of interrupted downloads.
 
 App availability follows actual upstream release assets. An app without a compatible published package stays unavailable; you can still open its source or link an existing installation. ArtCraft's hosted studio opens in your browser. WebAssembly builds are downloadable links, not an embedded launcher interface.
@@ -104,7 +104,11 @@ python3 scripts/package.py --binaries target/release --output /tmp/craftlauncher
 
 The payload **must actually be built with that version**. For development feeds, build with `CRAFTLAUNCHER_BUILD_VERSION=0.2.0 cargo build --release --bins`. A label on an old executable will fail the health check and roll back.
 
-Select the feed folder and the hexadecimal public key in Settings. The launcher verifies Ed25519 signatures and the entire archive, binds extracted executables to its signed contents and prepares updates without modifying the current program. Use Restart to update, or reopen the launcher to activate a prepared update. GitHub Releases provide public package downloads; the launcher update feed remains local and requires your own signing key.
+Select the feed folder and the hexadecimal public key in Settings. The launcher verifies Ed25519 signatures and the entire archive, binds extracted executables to its signed contents and prepares updates without modifying the current program. Use Restart to update, or reopen the launcher to activate a prepared update.
+
+## GitHub launcher updates
+
+By default the launcher checks the official [GitHub releases](https://github.com/EricVogt93/artcraft-launcher/releases/latest) for newer launcher versions — no signing key or extra setup required. Downloads are bound to the official repository and verified against the published SHA-256 checksums and the platform update manifest before preparation. Toggle it under **Settings → GitHub launcher updates**; a configured local signed feed takes priority. The same helper, first-frame health check and automatic rollback protect both update sources.
 
 ## Validate
 
