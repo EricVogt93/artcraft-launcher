@@ -124,7 +124,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: target
           key: freebsd-14.3-${{ hashFiles('Cargo.lock') }}
