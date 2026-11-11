@@ -376,17 +376,34 @@ impl Launcher {
         let Some(prepared) = self.snapshot.state.launcher_update.as_ref() else {
             return;
         };
-        let key = self
+        let trust = self
             .snapshot
             .state
             .settings
             .update_public_key
-            .as_deref()
-            .unwrap_or("");
+            .as_ref()
+            .map(|key| self_update::UpdateTrust::Signed {
+                public_key: key.clone(),
+            })
+            .or_else(|| {
+                self.snapshot
+                    .state
+                    .settings
+                    .github_update_feed
+                    .then_some(self_update::UpdateTrust::Github)
+            });
+        let Some(trust) = trust else {
+            self.toast = Some((
+                "No trusted update source is configured.".into(),
+                true,
+                Instant::now(),
+            ));
+            return;
+        };
         let result = std::env::current_exe()
             .map_err(craftlauncher_core::Error::from)
             .and_then(|exe| {
-                self_update::start_helper(&self.snapshot.root, prepared, &exe, key, 30)
+                self_update::start_helper(&self.snapshot.root, prepared, &exe, &trust, 30)
             });
         match result {
             Ok(()) => {

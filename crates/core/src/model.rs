@@ -30,6 +30,8 @@ pub struct Settings {
     pub notifications: bool,
     pub update_feed: Option<PathBuf>,
     pub update_public_key: Option<String>,
+    /// Check the official GitHub releases for launcher updates.
+    pub github_update_feed: bool,
     pub download_folder: Option<PathBuf>,
 }
 impl Default for Settings {
@@ -45,6 +47,7 @@ impl Default for Settings {
             notifications: true,
             update_feed: None,
             update_public_key: None,
+            github_update_feed: true,
             download_folder: None,
         }
     }
@@ -187,6 +190,8 @@ pub struct State {
     pub discovery_pages: Vec<crate::workspace::DiscoveryPage>,
     pub discovery_checked_at: Option<String>,
     pub discovery_error: Option<String>,
+    #[serde(default)]
+    pub launcher_release: Option<ReleaseCache>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -205,6 +210,7 @@ impl Default for State {
             discovery_pages: Vec::new(),
             discovery_checked_at: None,
             discovery_error: None,
+            launcher_release: None,
         }
     }
 }

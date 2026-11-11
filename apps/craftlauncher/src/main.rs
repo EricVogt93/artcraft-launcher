@@ -361,13 +361,10 @@ fn run(args: Args) -> Result<()> {
             .launcher_update
             .as_ref()
             .ok_or_else(|| fail("No verified launcher update is prepared."))?;
-        let key = manager
-            .state
-            .settings
-            .update_public_key
-            .as_deref()
-            .ok_or_else(|| fail("No update public key is configured."))?;
-        self_update::start_helper(&manager.root, prepared, &executable, key, 30)?;
+        let trust = manager
+            .launcher_update_trust()
+            .ok_or_else(|| fail("No trusted update source is configured."))?;
+        self_update::start_helper(&manager.root, prepared, &executable, &trust, 30)?;
     }
     if args.register_launcher {
         register_launcher(&executable)?;
@@ -381,13 +378,10 @@ fn run(args: Args) -> Result<()> {
             .as_ref()
             .filter(|p| self_update::build_version() != p.version)
     {
-        let key = manager
-            .state
-            .settings
-            .update_public_key
-            .as_deref()
-            .ok_or_else(|| fail("No trusted update key is configured."))?;
-        match self_update::start_helper(&manager.root, prepared, &executable, key, 30) {
+        let trust = manager
+            .launcher_update_trust()
+            .ok_or_else(|| fail("No trusted update source is configured."))?;
+        match self_update::start_helper(&manager.root, prepared, &executable, &trust, 30) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 manager.state.failed_launcher_version = Some(prepared.version.clone());
