@@ -82,13 +82,13 @@ impl Github {
             .filter(|value| !value.is_empty());
         Ok(Self {
             client: Client::builder()
-                .user_agent("CraftLauncher/0.1.0")
+                .user_agent(concat!("CraftLauncher/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(600))
                 .https_only(true)
                 .build()?,
             async_client: reqwest::Client::builder()
-                .user_agent("CraftLauncher/0.1.0")
+                .user_agent(concat!("CraftLauncher/", env!("CARGO_PKG_VERSION")))
                 .https_only(true)
                 .connect_timeout(Duration::from_secs(15))
                 .read_timeout(Duration::from_secs(20))
