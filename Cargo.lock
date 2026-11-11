@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "craftlauncher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "craftlauncher-core",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "craftlauncher-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "directories",
  "ed25519-dalek",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "craftlauncher-ui-egui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "craftlauncher-core",
  "eframe",
