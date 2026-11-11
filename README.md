@@ -12,6 +12,9 @@ Your creative tools, ready to launch.
 
 A native Rust toolbox for the [ArtCraft family](https://github.com/storytold). Install, launch, update and manage ArtCraft and other Craft apps in one desktop app. New public Craft repositories from the official account are discovered automatically.
 
+> [!WARNING]
+> The auto-updater was broken in version 0.1.0. If you are still running 0.1.0, please update once manually. The auto-updater works again in the latest versions — download the current release from the [releases page](https://github.com/EricVogt93/artcraft-launcher/releases/latest).
+
 **Independent project by Eric Vogt.** I develop only CraftLauncher. I am not affiliated with, employed by, sponsored by or endorsed by ArtCraft, Storytold or any of the applications this launcher manages. Their developers are solely responsible for their applications, licenses, updates and support. Please report launcher issues here and application issues to the respective upstream project.
 
 The UI follows ArtCraft's warm paper colors, blue accent, Archivo lettering and Instrument Serif headings. It uses **Rust 2024, eframe/egui 0.36, wgpu and rfd**, with no Electron, embedded browser or web UI.
