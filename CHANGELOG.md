@@ -2,7 +2,7 @@
 
 This changelog describes the launcher only. Changes to third-party apps are published by their own developers.
 
-## Unreleased
+## 0.2.0 — 2026-11-11
 
 - Discover and manage new public Storytold Craft repositories from a cached dynamic catalog, with safe package and application-entry selection.
 - Restore unfinished queue tasks paused after restart, resume partial downloads where supported and show transfer estimates.
