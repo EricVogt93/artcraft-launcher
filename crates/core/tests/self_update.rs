@@ -360,3 +360,61 @@ fn helper_integrity_failure_restores_the_old_process_and_bootstrap() {
         Some("1.1.0")
     );
 }
+
+#[test]
+fn reconcile_cleans_obsolete_launcher_versions_and_staging_while_keeping_active() {
+    let tmp = tempfile::tempdir().unwrap();
+    let library = tmp.path().join("library");
+    fs::create_dir_all(library.join("launcher/versions/.staging-stale")).unwrap();
+
+    let (feed_v1, key_v1, _) = fixture(&tmp.path().join("f1"), b"#!/bin/sh\nexit 0\n", "1.1.0");
+    let v1 = self_update::prepare(
+        &library,
+        &feed_v1,
+        &key_v1,
+        Channel::Stable,
+        "1.0.0",
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+
+    let (feed_v2, key_v2, _) = fixture(&tmp.path().join("f2"), b"#!/bin/sh\nexit 0\n", "1.2.0");
+    let v2 = self_update::prepare(
+        &library,
+        &feed_v2,
+        &key_v2,
+        Channel::Stable,
+        "1.1.0",
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(library.join(&v1.directory).is_dir());
+    assert!(library.join(&v2.directory).is_dir());
+
+    atomic_json(
+        &library.join("launcher/current.json"),
+        &BootPointer {
+            version: "1.2.0".into(),
+            executable: fs::canonicalize(library.join(&v2.executable)).unwrap(),
+        },
+    )
+    .unwrap();
+    atomic_json(
+        &library.join("launcher/last-update.json"),
+        &self_update::UpdateReport {
+            version: "1.2.0".into(),
+            success: true,
+            restored: None,
+        },
+    )
+    .unwrap();
+
+    let manager = Manager::open(library.clone()).unwrap();
+    assert!(!library.join("launcher/versions/.staging-stale").exists());
+    assert!(!library.join(&v1.directory).exists());
+    assert!(library.join(&v2.directory).is_dir());
+    assert!(manager.storage_report().unwrap().launcher_bytes > 0);
+}

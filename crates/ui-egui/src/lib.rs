@@ -79,6 +79,17 @@ pub struct Launcher {
     selected_cache: BTreeSet<String>,
     confirm_cache: bool,
     exit_after: Option<Instant>,
+    applied_theme: Option<(craftlauncher_core::Theme, Option<egui::Theme>)>,
+    existing_recent: BTreeSet<PathBuf>,
+}
+fn recent_file_set(snapshot: &Snapshot) -> BTreeSet<PathBuf> {
+    snapshot
+        .state
+        .recent_projects
+        .iter()
+        .filter(|p| p.path.is_file())
+        .map(|p| p.path.clone())
+        .collect()
 }
 fn transfer_details(progress: &Progress) -> Option<String> {
     let transferred = progress.transferred_bytes? as f64 / 1_000_000.0;
@@ -124,7 +135,14 @@ impl Launcher {
         };
         let launcher = std::env::current_exe().unwrap_or_default();
         let workflows = workflows::Workflows::restore(&snapshot.root);
-        let worker = Worker::new(manager, launcher);
+        let applied_theme = Some((snapshot.state.settings.theme, cc.egui_ctx.system_theme()));
+        let existing_recent = recent_file_set(&snapshot);
+        let egui_ctx = cc.egui_ctx.clone();
+        let worker = Worker::with_waker(
+            manager,
+            launcher,
+            std::sync::Arc::new(move || egui_ctx.request_repaint()),
+        );
         Self {
             workflows,
             worker,
@@ -161,6 +179,8 @@ impl Launcher {
             selected_cache: BTreeSet::new(),
             confirm_cache: false,
             exit_after: exit_after.map(|duration| Instant::now() + duration),
+            applied_theme,
+            existing_recent,
         }
     }
     fn command(&mut self, command: Command) {
@@ -170,11 +190,41 @@ impl Launcher {
                 | Command::Repair(_)
                 | Command::UpdateReviewed { .. }
                 | Command::DownloadSelected { .. }
-                | Command::OpenProject { .. }
-                | Command::Launch(_)
         ) {
             self.enqueue(command);
             return;
+        }
+        match &command {
+            Command::Preferences(id, prefs) => {
+                let channel = prefs
+                    .channel
+                    .unwrap_or(self.snapshot.state.settings.channel);
+                self.snapshot
+                    .state
+                    .preferences
+                    .insert(id.clone(), prefs.clone());
+                if let Some(cache) = self.snapshot.state.releases.get_mut(id) {
+                    cache.set_channel(channel);
+                }
+            }
+            Command::Configure(settings) => {
+                let channel_changed = settings.channel != self.snapshot.state.settings.channel;
+                self.snapshot.state.settings = settings.clone();
+                if channel_changed {
+                    let global = self.snapshot.state.settings.channel;
+                    for (id, cache) in &mut self.snapshot.state.releases {
+                        let ch = self
+                            .snapshot
+                            .state
+                            .preferences
+                            .get(id)
+                            .and_then(|p| p.channel)
+                            .unwrap_or(global);
+                        cache.set_channel(ch);
+                    }
+                }
+            }
+            _ => {}
         }
         if let Err(e) = self.worker.send(command) {
             self.toast = Some((e.to_string(), true, Instant::now()));
@@ -194,7 +244,10 @@ impl Launcher {
         }
         while let Ok(event) = self.worker.events.try_recv() {
             match event {
-                Event::State(snapshot) => self.snapshot = *snapshot,
+                Event::State(snapshot) => {
+                    self.existing_recent = recent_file_set(&snapshot);
+                    self.snapshot = *snapshot;
+                }
                 Event::LocalApps(apps) => self.workflows.local = apps,
                 Event::Entrypoints { app_id, paths } => {
                     self.workflows.entrypoint_choices = Some((app_id, paths));
@@ -261,7 +314,11 @@ impl Launcher {
                 self.workflows.projects.push(path.to_path_buf());
             }
         }
-        self.palette = theme::apply(ctx, self.snapshot.state.settings.theme);
+        let theme_key = (self.snapshot.state.settings.theme, ctx.system_theme());
+        if self.applied_theme != Some(theme_key) {
+            self.palette = theme::apply(ctx, self.snapshot.state.settings.theme);
+            self.applied_theme = Some(theme_key);
+        }
         if !self.tray_attempted {
             self.tray_attempted = true;
             match Tray::new(ctx) {
@@ -306,7 +363,14 @@ impl Launcher {
         {
             self.toast = None;
         }
-        ctx.request_repaint_after(Duration::from_millis(500));
+        let mut next_repaint = Duration::from_secs(2);
+        if let Some((_, _, at)) = &self.toast {
+            next_repaint = next_repaint.min(Duration::from_secs(8).saturating_sub(at.elapsed()));
+        }
+        if let Some(deadline) = self.exit_after {
+            next_repaint = next_repaint.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        ctx.request_repaint_after(next_repaint);
     }
     fn restart_update(&mut self, ctx: &Context) {
         let Some(prepared) = self.snapshot.state.launcher_update.as_ref() else {

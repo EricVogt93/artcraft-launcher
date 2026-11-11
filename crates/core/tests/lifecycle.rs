@@ -1227,6 +1227,25 @@ fn local_discovery_finds_known_apps_without_executing_them_and_ignores_wrappers(
                 .executable
                 .ends_with("gridcraft-0.8.0-linux-x86_64.AppImage")
     }));
+
+    let opt = tmp.path().join("opt");
+    fs::create_dir_all(opt.join("PhotoCraft/bin")).unwrap();
+    let opt_bin = opt.join("PhotoCraft/bin/photocraft");
+    fs::write(&opt_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+    installer::make_executable(&opt_bin).unwrap();
+    let v_appimage = opt.join("LightCraft-v1.2.0-x86_64.appimage");
+    fs::write(&v_appimage, b"#!/bin/sh\nexit 0\n").unwrap();
+    installer::make_executable(&v_appimage).unwrap();
+    let opt_result = workspace::discover_local(&[opt], &manager.snapshot());
+    assert!(opt_result.iter().any(|app| {
+        app.app_id == "photocraft" && app.executable.ends_with("PhotoCraft/bin/photocraft")
+    }));
+    assert!(opt_result.iter().any(|app| {
+        app.app_id == "lightcraft"
+            && app
+                .executable
+                .ends_with("LightCraft-v1.2.0-x86_64.appimage")
+    }));
 }
 
 #[test]
@@ -1775,4 +1794,47 @@ fn queued_tasks_report_their_own_ids_and_can_continue_after_a_failure() {
             std::thread::yield_now();
         }
     }
+}
+
+#[test]
+fn native_running_apps_batches_checks_and_fast_commands_enqueue_without_busy_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let empty = std::collections::BTreeMap::new();
+    assert!(Native.running_apps(&empty).is_empty());
+
+    let mut targets = std::collections::BTreeMap::new();
+    targets.insert("current".to_owned(), std::env::current_exe().unwrap());
+    targets.insert("missing".to_owned(), tmp.path().join("not-running"));
+    let running = Native.running_apps(&targets);
+    assert_eq!(running.get("current"), Some(&true));
+    assert_eq!(running.get("missing"), Some(&false));
+
+    let (mut manager, _, _) = setup(tmp.path());
+    manager.state.settings.check_on_startup = false;
+    let woken = Arc::new(AtomicBool::new(false));
+    let woken_clone = woken.clone();
+    let worker = Worker::with_waker(
+        manager,
+        PathBuf::from("launcher"),
+        Arc::new(move || woken_clone.store(true, Ordering::Release)),
+    );
+    let prefs = AppPreferences {
+        favorite: true,
+        ..Default::default()
+    };
+    worker
+        .send(Command::Preferences("photocraft".into(), prefs))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        assert!(std::time::Instant::now() < deadline);
+        if let Ok(Event::Finished(result)) = worker
+            .events
+            .recv_timeout(std::time::Duration::from_millis(200))
+        {
+            assert!(result.is_ok());
+            break;
+        }
+    }
+    assert!(woken.load(Ordering::Acquire));
 }

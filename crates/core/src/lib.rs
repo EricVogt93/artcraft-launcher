@@ -26,6 +26,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("Multiple application entries found. Select a path relative to the package: {}", .0.join(", "))]
     Entrypoints(Vec<String>),
+    #[error("CraftLauncher is already using this library. Close the other instance first.")]
+    LibraryLocked,
+    #[error("GitHub rate limit reached. Please try again later.")]
+    RateLimited,
+    #[error("{0}")]
+    Cancelled(String),
     #[error("{0}")]
     Message(String),
     #[error("{0}")]
@@ -35,6 +41,18 @@ pub enum Error {
     #[error("{0}")]
     Network(#[from] reqwest::Error),
 }
+impl Error {
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Cancelled(_) => true,
+            Self::Message(msg) => msg.to_ascii_lowercase().contains("cancelled"),
+            _ => false,
+        }
+    }
+}
 pub fn fail(message: impl Into<String>) -> Error {
     Error::Message(message.into())
+}
+pub fn cancelled(message: impl Into<String>) -> Error {
+    Error::Cancelled(message.into())
 }

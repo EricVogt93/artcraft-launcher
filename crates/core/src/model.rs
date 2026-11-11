@@ -99,6 +99,39 @@ pub struct ReleaseCache {
     pub versions: Vec<Release>,
     pub error: Option<String>,
 }
+impl ReleaseCache {
+    pub fn versions_for(&self, channel: Channel) -> impl Iterator<Item = &Release> {
+        self.versions
+            .iter()
+            .filter(move |r| !r.draft && (channel == Channel::Preview || !r.prerelease))
+    }
+
+    pub fn release_for(&self, channel: Channel) -> Option<&Release> {
+        if self.channel == channel
+            && let Some(release) = self
+                .release
+                .as_ref()
+                .filter(|r| !r.draft && (channel == Channel::Preview || !r.prerelease))
+        {
+            return Some(release);
+        }
+        self.versions_for(channel).next().or_else(|| {
+            self.release
+                .as_ref()
+                .filter(|r| !r.draft && (channel == Channel::Preview || !r.prerelease))
+        })
+    }
+
+    pub fn set_channel(&mut self, channel: Channel) {
+        self.channel = channel;
+        let from_versions = self.versions_for(channel).next().cloned();
+        self.release = from_versions.or_else(|| {
+            self.release
+                .take()
+                .filter(|r| !r.draft && (channel == Channel::Preview || !r.prerelease))
+        });
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Version {
     pub version: String,
