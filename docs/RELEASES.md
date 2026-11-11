@@ -18,13 +18,19 @@ Desktop graphics remain required. Hosted Windows/macOS runners may need graphics
 6. The new app acknowledges health only after its first native frame and only when its embedded version matches the manifest. Failure, timeout or spawn failure restores the previous pointer and launches the previous executable.
 7. The worker consumes the update report into local Activity and clears the prepared state. Failed versions are blocked from automatic retries until a newer version is available. A manual check can explicitly retry.
 
-Existing shortcuts route through the original executable/bootstrap to the current pointer. Updated launcher versions stay immutable; the previous launcher remains available for recovery. Old successful launcher payloads are retained deliberately. Production disk-retention policy and a public network feed are future work; neither is silently enabled here.
+Existing shortcuts route through the original executable/bootstrap to the current pointer. Updated launcher versions stay immutable; the previous launcher remains available for recovery. Old successful launcher payloads are retained deliberately. Production disk-retention policy remains future work.
+
+## GitHub release feed
+
+By default the launcher also checks the official `EricVogt93/artcraft-launcher` GitHub releases for newer launcher versions (Settings → GitHub launcher updates, or `github_update_feed` in the library settings). Release tags carry build metadata (`v<version>+build.<run>.<attempt>`); the base version is compared against the embedded launcher version, so a new workspace version is required for an update to be offered.
+
+The GitHub feed is unsigned. Trust comes from HTTPS to `github.com` plus the release's published SHA-256 sums: preparation downloads the exact archive named by the platform manifest, verifies it against both the checksum file and the manifest, and re-verifies the staged copy before extraction. Download URLs must point at the official repository's release assets. A configured local signed feed takes priority over the GitHub feed; the Ed25519 signature path is unchanged. The helper, health acknowledgement and rollback behave identically for both sources.
 
 ## Signing and publishing
 
 Only the main-release job receives `contents: write`; build and PR jobs keep read-only repository permissions. The publisher downloads this workflow run's seven artifact bundles, requires all platform packages, checks every SHA-256 sum and binds each manifest to its exact archive, version and native target before publication. Six Python tests exercise complete assets and failure cases. Its tag `v<version>+build.<run>.<attempt>` points at the exact built commit, so later main commits and retries receive distinct tags. The package and embedded version remains the workspace version; bump it for a new launcher version. Download packages from [GitHub Releases](https://github.com/EricVogt93/artcraft-launcher/releases/latest).
 
-macOS bundles receive ad-hoc signatures. Developer ID signing/notarization, Windows Authenticode and a trusted public launcher update feed still require the owning project's signing credentials. Published local-feed manifests are unsigned and are not trusted automatically by the launcher. CI does not embed a signing key.
+macOS bundles receive ad-hoc signatures. Developer ID signing/notarization and Windows Authenticode still require the owning project's signing credentials. The GitHub release feed verifies checksums over HTTPS but is not cryptographically signed; a signed local feed remains available for stronger guarantees. CI does not embed a signing key.
 
 See `scripts/update_smoke.py` for healthy and mismatched-version counterprobes against actual separate launcher/helper processes. Core tests additionally cover signature changes, wrong keys, archive substitution, extracted helper tampering, no-health failure, spawn failure and timeout recovery.
 

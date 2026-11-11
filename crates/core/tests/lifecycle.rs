@@ -3,6 +3,7 @@ use craftlauncher_core::{
     releases::{asset_for, checksum_from_manifest, trusted_asset_url},
     *,
 };
+use ed25519_dalek::Signer;
 use flate2::{Compression, write::GzEncoder};
 use std::{
     fs,
@@ -23,6 +24,16 @@ struct Fixture {
     cancel_download: bool,
     download_count: usize,
     native_arch: bool,
+    launcher: Option<LauncherFeed>,
+}
+#[derive(Clone)]
+struct LauncherFeed {
+    version: String,
+    archive: Vec<u8>,
+    manifest: Vec<u8>,
+    sums: Vec<u8>,
+    bad_checksum: bool,
+    downloads: usize,
 }
 fn archive(contents: &[u8]) -> Vec<u8> {
     let encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -121,6 +132,101 @@ impl Remote for FakeRemote {
         use sha2::Digest;
         Ok(format!("{:x}", sha2::Sha256::digest(&fixture.bytes)))
     }
+    fn launcher_releases(
+        &self,
+        channel: Channel,
+        _: Option<&ReleaseCache>,
+    ) -> Result<ReleaseCache> {
+        let fixture = self.0.lock().unwrap();
+        if fixture.network_bad {
+            return Err(fail("offline fixture"));
+        }
+        let feed = fixture
+            .launcher
+            .as_ref()
+            .ok_or_else(|| fail("no launcher feed fixture"))?;
+        let target = self_update::target_id();
+        let stem = format!("craftlauncher-{}-{target}", feed.version);
+        let archive_name = format!("{stem}.tar.gz");
+        let url = |name: &str| {
+            format!(
+                "https://github.com/EricVogt93/artcraft-launcher/releases/download/v{}/{name}",
+                feed.version
+            )
+        };
+        let release = Release {
+            tag_name: format!("v{}+build.9.1", feed.version),
+            name: None,
+            body: None,
+            published_at: Some("2026-11-11T00:00:00Z".into()),
+            prerelease: false,
+            draft: false,
+            assets: vec![
+                Asset {
+                    name: archive_name.clone(),
+                    browser_download_url: url(&archive_name),
+                    size: feed.archive.len() as u64,
+                    digest: None,
+                },
+                Asset {
+                    name: format!("manifest-{target}-stable.json"),
+                    browser_download_url: url(&format!("manifest-{target}-stable.json")),
+                    size: feed.manifest.len() as u64,
+                    digest: None,
+                },
+                Asset {
+                    name: format!("{stem}-SHA256SUMS.txt"),
+                    browser_download_url: url(&format!("{stem}-SHA256SUMS.txt")),
+                    size: feed.sums.len() as u64,
+                    digest: None,
+                },
+            ],
+        };
+        Ok(ReleaseCache {
+            channel,
+            etag: None,
+            checked_at: model::now(),
+            release: Some(release.clone()),
+            versions: vec![release],
+            error: None,
+        })
+    }
+    fn launcher_asset_text(&self, asset: &Asset) -> Result<String> {
+        let fixture = self.0.lock().unwrap();
+        let feed = fixture
+            .launcher
+            .as_ref()
+            .ok_or_else(|| fail("no launcher feed fixture"))?;
+        let bytes = if asset.name.starts_with("manifest-") {
+            &feed.manifest
+        } else {
+            &feed.sums
+        };
+        Ok(String::from_utf8(bytes.clone()).unwrap())
+    }
+    fn download_launcher_asset(
+        &self,
+        _asset: &Asset,
+        path: &Path,
+        _cancel: &AtomicBool,
+        progress: &mut dyn FnMut(f32),
+    ) -> Result<String> {
+        let mut fixture = self.0.lock().unwrap();
+        let feed = fixture
+            .launcher
+            .as_mut()
+            .ok_or_else(|| fail("no launcher feed fixture"))?;
+        feed.downloads += 1;
+        fs::write(path, &feed.archive)?;
+        progress(100.0);
+        use sha2::Digest;
+        let bytes: &[u8] = if feed.bad_checksum {
+            b"corrupted"
+        } else {
+            &feed.archive
+        };
+        Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+    }
 }
 struct FakePlatform {
     running: Arc<AtomicBool>,
@@ -183,6 +289,7 @@ fn setup(root: &Path) -> (Manager, Arc<Mutex<Fixture>>, Arc<AtomicBool>) {
         cancel_download: false,
         download_count: 0,
         native_arch: false,
+        launcher: None,
     }));
     let running = Arc::new(AtomicBool::new(false));
     let mut manager = Manager::with_services(
@@ -1837,4 +1944,186 @@ fn native_running_apps_batches_checks_and_fast_commands_enqueue_without_busy_err
         }
     }
     assert!(woken.load(Ordering::Acquire));
+}
+
+fn launcher_feed(version: &str) -> LauncherFeed {
+    let archive = {
+        let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for name in ["craftlauncher", "craftlauncher-updater"] {
+            let contents: &[u8] = b"#!/bin/sh\nexit 0\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, name, contents).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    let target = self_update::target_id();
+    let archive_name = format!("craftlauncher-{version}-{target}.tar.gz");
+    use sha2::Digest;
+    let digest = format!("{:x}", sha2::Sha256::digest(&archive));
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "version": version,
+        "channel": "stable",
+        "target": target,
+        "archive": archive_name,
+        "sha256": digest,
+        "bytes": archive.len(),
+        "executable": "craftlauncher",
+        "helper": "craftlauncher-updater",
+    }))
+    .unwrap();
+    let sums = format!("{digest}  {archive_name}\n").into_bytes();
+    LauncherFeed {
+        version: version.into(),
+        archive,
+        manifest,
+        sums,
+        bad_checksum: false,
+        downloads: 0,
+    }
+}
+
+#[test]
+fn github_feed_prepares_verifies_and_respects_version_and_pause() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, _running) = setup(tmp.path());
+    fixture.lock().unwrap().launcher = Some(launcher_feed("99.0.0"));
+    assert!(manager.state.settings.github_update_feed);
+    manager
+        .check_launcher_update(true, &AtomicBool::new(false))
+        .unwrap();
+    let prepared = manager
+        .state
+        .launcher_update
+        .as_ref()
+        .expect("GitHub feed must prepare the newer launcher");
+    assert_eq!(prepared.version, "99.0.0");
+    assert_eq!(
+        fixture.lock().unwrap().launcher.as_ref().unwrap().downloads,
+        1
+    );
+    assert!(matches!(
+        manager.launcher_update_trust(),
+        Some(self_update::UpdateTrust::Github)
+    ));
+    self_update::verify_prepared(tmp.path(), prepared, &self_update::UpdateTrust::Github).unwrap();
+    // A second check keeps the prepared update without downloading again.
+    manager
+        .check_launcher_update(true, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(
+        fixture.lock().unwrap().launcher.as_ref().unwrap().downloads,
+        1
+    );
+    // An older release never replaces the prepared update or the current version.
+    manager.state.launcher_update = None;
+    fixture.lock().unwrap().launcher = Some(launcher_feed("0.0.1"));
+    manager
+        .check_launcher_update(true, &AtomicBool::new(false))
+        .unwrap();
+    assert!(manager.state.launcher_update.is_none());
+    assert_eq!(
+        fixture.lock().unwrap().launcher.as_ref().unwrap().downloads,
+        0
+    );
+    // Disabling both feeds stops checks entirely.
+    fixture.lock().unwrap().launcher = Some(launcher_feed("99.1.0"));
+    manager.state.settings.github_update_feed = false;
+    manager
+        .check_launcher_update(true, &AtomicBool::new(false))
+        .unwrap();
+    assert!(manager.state.launcher_update.is_none());
+    assert_eq!(
+        fixture.lock().unwrap().launcher.as_ref().unwrap().downloads,
+        0
+    );
+}
+
+#[test]
+fn github_feed_rejects_checksum_mismatch_without_preparing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, _running) = setup(tmp.path());
+    let mut feed = launcher_feed("99.0.0");
+    feed.bad_checksum = true;
+    fixture.lock().unwrap().launcher = Some(feed);
+    assert!(
+        manager
+            .check_launcher_update(true, &AtomicBool::new(false))
+            .is_err()
+    );
+    assert!(manager.state.launcher_update.is_none());
+    assert!(
+        manager
+            .state
+            .activity
+            .iter()
+            .any(|event| event.action == "launcher update" && event.error)
+    );
+    let leftovers: Vec<_> = fs::read_dir(tmp.path().join("launcher"))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".update-download-")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "failed downloads must be cleaned up");
+}
+
+#[test]
+fn local_signed_feed_takes_priority_over_github() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut manager, fixture, _running) = setup(tmp.path());
+    fixture.lock().unwrap().launcher = Some(launcher_feed("99.0.0"));
+    let feed_dir = tmp.path().join("local-feed");
+    fs::create_dir_all(&feed_dir).unwrap();
+    let archive_bytes = launcher_feed("98.0.0").archive;
+    let archive_path = feed_dir.join("launcher.tar.gz");
+    fs::write(&archive_path, &archive_bytes).unwrap();
+    let target = self_update::target_id();
+    use sha2::Digest;
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "version": "98.0.0",
+        "channel": "stable",
+        "target": target,
+        "archive": "launcher.tar.gz",
+        "sha256": format!("{:x}", sha2::Sha256::digest(&archive_bytes)),
+        "bytes": archive_bytes.len(),
+        "executable": "craftlauncher",
+        "helper": "craftlauncher-updater",
+    });
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let manifest_path = feed_dir.join(format!("manifest-{target}-stable.json"));
+    fs::write(&manifest_path, &bytes).unwrap();
+    fs::write(
+        format!("{}.sig", manifest_path.display()),
+        hex::encode(key.sign(&bytes).to_bytes()),
+    )
+    .unwrap();
+    manager.state.settings.update_feed = Some(feed_dir);
+    manager.state.settings.update_public_key = Some(hex::encode(key.verifying_key().as_bytes()));
+    manager
+        .check_launcher_update(true, &AtomicBool::new(false))
+        .unwrap();
+    let prepared = manager.state.launcher_update.as_ref().unwrap();
+    assert_eq!(prepared.version, "98.0.0");
+    assert_eq!(
+        fixture.lock().unwrap().launcher.as_ref().unwrap().downloads,
+        0
+    );
+    assert!(matches!(
+        manager.launcher_update_trust(),
+        Some(self_update::UpdateTrust::Signed { .. })
+    ));
 }

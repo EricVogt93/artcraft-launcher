@@ -365,25 +365,25 @@ impl Manager {
         {
             return Ok(());
         }
-        let settings = &self.state.settings;
-        let (Some(feed), Some(key)) = (&settings.update_feed, &settings.update_public_key) else {
-            return Ok(());
-        };
         let current = crate::self_update::build_version();
         let threshold = self
             .state
             .failed_launcher_version
             .as_deref()
             .filter(|v| !force && is_newer(v, current))
-            .unwrap_or(current);
-        match crate::self_update::prepare(
-            &self.root,
-            feed,
-            key,
-            settings.channel,
-            threshold,
-            cancel,
-        ) {
+            .unwrap_or(current)
+            .to_string();
+        let settings = self.state.settings.clone();
+        let result = if let (Some(feed), Some(key)) =
+            (&settings.update_feed, &settings.update_public_key)
+        {
+            crate::self_update::prepare(&self.root, feed, key, settings.channel, &threshold, cancel)
+        } else if settings.github_update_feed {
+            self.check_launcher_github(settings.channel, &threshold, cancel)
+        } else {
+            return Ok(());
+        };
+        match result {
             Ok(prepared) => {
                 self.state.launcher_update = prepared;
                 self.save()
@@ -394,6 +394,132 @@ impl Manager {
                 Err(e)
             }
         }
+    }
+
+    /// Check the official GitHub release feed. Downloads are bound to the exact
+    /// repository and verified against the published SHA-256 sums and manifest.
+    fn check_launcher_github(
+        &mut self,
+        channel: Channel,
+        threshold: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::self_update::PreparedUpdate>> {
+        let cache = match self
+            .remote
+            .launcher_releases(channel, self.state.launcher_release.as_ref())
+        {
+            Ok(cache) => cache,
+            Err(e) => {
+                if let Some(previous) = &mut self.state.launcher_release {
+                    previous.error = Some(e.to_string());
+                }
+                return Err(e);
+            }
+        };
+        self.state.launcher_release = Some(cache.clone());
+        let Some(release) = cache.release_for(channel) else {
+            return Ok(None);
+        };
+        let Some(version) = crate::model::version_number(&release.tag_name) else {
+            return Ok(None);
+        };
+        if !is_newer(&version.to_string(), threshold) {
+            return Ok(None);
+        }
+        let target = crate::self_update::target_id();
+        let manifest_name = format!(
+            "manifest-{target}-{}.json",
+            match channel {
+                Channel::Stable => "stable",
+                Channel::Preview => "preview",
+            }
+        );
+        let manifest_asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == manifest_name)
+            .ok_or_else(|| fail("The latest release has no update manifest for this platform."))?;
+        let manifest_bytes = self
+            .remote
+            .launcher_asset_text(manifest_asset)?
+            .into_bytes();
+        let manifest = crate::self_update::parse_manifest(&manifest_bytes)?;
+        let manifest_version = crate::model::version_number(&manifest.version);
+        let same_base = manifest_version
+            .as_ref()
+            .zip(Some(&version))
+            .is_some_and(|(a, b)| {
+                a.major == b.major && a.minor == b.minor && a.patch == b.patch && a.pre == b.pre
+            });
+        if manifest.channel != channel || !same_base {
+            return Err(fail(
+                "The release update manifest does not match its release.",
+            ));
+        }
+        let archive = release
+            .assets
+            .iter()
+            .find(|a| a.name == manifest.archive)
+            .ok_or_else(|| fail("The release update archive is missing."))?;
+        if archive.size != manifest.bytes {
+            return Err(fail("The release update archive has an invalid size."));
+        }
+        let sums_name = format!(
+            "{}-SHA256SUMS.txt",
+            manifest
+                .archive
+                .trim_end_matches(".tar.gz")
+                .trim_end_matches(".zip")
+        );
+        let sums_asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == sums_name)
+            .ok_or_else(|| fail("The release has no checksums for the update archive."))?;
+        let sums = self.remote.launcher_asset_text(sums_asset)?;
+        let expected = crate::releases::checksum_from_manifest(&sums, &archive.name)?;
+        if expected != manifest.sha256.to_ascii_lowercase() {
+            return Err(fail(
+                "The release checksums do not match the update manifest.",
+            ));
+        }
+        let folder = self.root.join("launcher");
+        fs::create_dir_all(&folder)?;
+        let part = folder.join(format!(".update-download-{}.part", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let digest =
+                self.remote
+                    .download_launcher_asset(archive, &part, cancel, &mut |_| {})?;
+            if digest != expected {
+                return Err(fail("Launcher archive checksum mismatch."));
+            }
+            crate::self_update::prepare_downloaded(
+                &self.root,
+                &part,
+                &manifest_bytes,
+                channel,
+                threshold,
+                cancel,
+            )
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&part);
+        }
+        result
+    }
+
+    /// Trust anchor for the prepared update: a configured local signing key wins,
+    /// otherwise the update came from the official GitHub feed.
+    pub fn launcher_update_trust(&self) -> Option<crate::self_update::UpdateTrust> {
+        if let Some(key) = &self.state.settings.update_public_key {
+            return Some(crate::self_update::UpdateTrust::Signed {
+                public_key: key.clone(),
+            });
+        }
+        if self.state.settings.github_update_feed {
+            return Some(crate::self_update::UpdateTrust::Github);
+        }
+        None
     }
     pub fn snapshot(&self) -> Snapshot {
         let mut executables = BTreeMap::new();

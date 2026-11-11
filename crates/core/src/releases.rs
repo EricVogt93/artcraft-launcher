@@ -65,6 +65,27 @@ pub trait Remote: Send {
     ) -> Result<String> {
         self.download(&product.id, asset, destination, cancel, progress)
     }
+    /// Fetch the launcher's own release feed. Defaults to unsupported so local
+    /// or test remotes keep working without a GitHub feed.
+    fn launcher_releases(
+        &self,
+        _channel: Channel,
+        _cached: Option<&ReleaseCache>,
+    ) -> Result<ReleaseCache> {
+        Err(fail("This remote has no launcher update feed."))
+    }
+    fn launcher_asset_text(&self, _asset: &Asset) -> Result<String> {
+        Err(fail("This remote has no launcher update feed."))
+    }
+    fn download_launcher_asset(
+        &self,
+        _asset: &Asset,
+        _destination: &Path,
+        _cancel: &AtomicBool,
+        _progress: &mut dyn FnMut(f32),
+    ) -> Result<String> {
+        Err(fail("This remote has no launcher update feed."))
+    }
 }
 
 pub struct Github {
@@ -102,11 +123,40 @@ impl Github {
     }
 }
 
+impl Github {
+    fn asset_text(&self, asset: &Asset) -> Result<String> {
+        let mut response = self
+            .client
+            .get(&asset.browser_download_url)
+            .timeout(Duration::from_secs(25))
+            .send()?
+            .error_for_status()?;
+        let mut body = String::new();
+        Read::by_ref(&mut response)
+            .take(100_001)
+            .read_to_string(&mut body)?;
+        if body.len() > 100_000 {
+            return Err(fail("Invalid checksum manifest."));
+        }
+        Ok(body)
+    }
+}
+
 pub fn trusted_asset_url(id: &str, raw: &str) -> Result<()> {
     trusted_repository_asset_url(crate::app(id)?.repository(), raw)
 }
 
 pub fn trusted_repository_asset_url(repository: &str, raw: &str) -> Result<()> {
+    trusted_owner_asset_url("storytold", repository, raw)
+        .map_err(|_| fail("Downloads must come from the official storytold release."))
+}
+
+pub fn trusted_launcher_asset_url(raw: &str) -> Result<()> {
+    trusted_owner_asset_url("EricVogt93", "artcraft-launcher", raw)
+        .map_err(|_| fail("Launcher downloads must come from the official GitHub release."))
+}
+
+fn trusted_owner_asset_url(owner: &str, repository: &str, raw: &str) -> Result<()> {
     if repository.is_empty()
         || !repository
             .bytes()
@@ -122,11 +172,9 @@ pub fn trusted_repository_asset_url(repository: &str, raw: &str) -> Result<()> {
         || url.password().is_some()
         || !url
             .path()
-            .starts_with(&format!("/storytold/{repository}/releases/download/"))
+            .starts_with(&format!("/{owner}/{repository}/releases/download/"))
     {
-        return Err(fail(
-            "Downloads must come from the official storytold release.",
-        ));
+        return Err(fail("Invalid release download URL."));
     }
     Ok(())
 }
@@ -342,19 +390,7 @@ impl Remote for Github {
             }
         };
         trusted_repository_asset_url(&product.repository, &sums.browser_download_url)?;
-        let mut response = self
-            .client
-            .get(&sums.browser_download_url)
-            .timeout(Duration::from_secs(25))
-            .send()?
-            .error_for_status()?;
-        let mut body = String::new();
-        Read::by_ref(&mut response)
-            .take(100_001)
-            .read_to_string(&mut body)?;
-        if body.len() > 100_000 {
-            return Err(fail("Invalid checksum manifest."));
-        }
+        let body = self.asset_text(sums)?;
         checksum_from_manifest(&body, &asset.name)
     }
     fn download(
@@ -394,6 +430,44 @@ impl Remote for Github {
             progress,
         ))
     }
+    fn launcher_releases(
+        &self,
+        channel: Channel,
+        cached: Option<&ReleaseCache>,
+    ) -> Result<ReleaseCache> {
+        fetch_releases(
+            &self.client,
+            "https://api.github.com",
+            self.token.as_deref(),
+            "EricVogt93/artcraft-launcher",
+            channel,
+            cached,
+        )
+    }
+    fn launcher_asset_text(&self, asset: &Asset) -> Result<String> {
+        trusted_launcher_asset_url(&asset.browser_download_url)?;
+        self.asset_text(asset)
+    }
+    fn download_launcher_asset(
+        &self,
+        asset: &Asset,
+        destination: &Path,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(f32),
+    ) -> Result<String> {
+        trusted_launcher_asset_url(&asset.browser_download_url)?;
+        if asset.size == 0 || asset.size > 2 * 1024 * 1024 * 1024 {
+            return Err(fail("Invalid download size."));
+        }
+        self.runtime.block_on(download_http(
+            &self.async_client,
+            &asset.browser_download_url,
+            asset.size,
+            destination,
+            cancel,
+            progress,
+        ))
+    }
 }
 
 fn fetch_release_product(
@@ -404,10 +478,26 @@ fn fetch_release_product(
     channel: Channel,
     cached: Option<&ReleaseCache>,
 ) -> Result<ReleaseCache> {
+    fetch_releases(
+        client,
+        base,
+        token,
+        &format!("storytold/{repository}"),
+        channel,
+        cached,
+    )
+}
+
+fn fetch_releases(
+    client: &Client,
+    base: &str,
+    token: Option<&str>,
+    owner_repo: &str,
+    channel: Channel,
+    cached: Option<&ReleaseCache>,
+) -> Result<ReleaseCache> {
     let mut request = client
-        .get(format!(
-            "{base}/repos/storytold/{repository}/releases?per_page=30"
-        ))
+        .get(format!("{base}/repos/{owner_repo}/releases?per_page=30"))
         .timeout(Duration::from_secs(25))
         .header("Accept", "application/vnd.github+json");
     if let Some(token) = token {
